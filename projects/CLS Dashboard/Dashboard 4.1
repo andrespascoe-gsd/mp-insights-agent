@@ -1,1 +1,881 @@
+# canva_account_level_CLS_Dashboard_v4.2.py
+# Canva — Account-Level Conversion Lift Studies (CLS) Dashboard
+# v4.2 — Lark URL ingestion · robust date parser (no 1970 epoch) ·
+#        Start/End Date aliasing · per-study line charts bounded to study window
 
+import io
+import re
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+from datetime import datetime, date
+from urllib.parse import urlparse, parse_qs
+
+APP_VERSION = "v4.2"
+
+# ----------------------------- Page setup -----------------------------
+st.set_page_config(
+    page_title=f"Canva CLS Dashboard {APP_VERSION}",
+    page_icon="📈",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 1.2rem; }
+      .metric-card {
+        background:#fff;border:1px solid #eef0f3;border-radius:14px;
+        padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.04);
+      }
+      .chip {
+        display:inline-block;padding:4px 10px;margin:2px 6px 2px 0;
+        border-radius:999px;background:#F1F5F9;color:#0F172A;
+        font-size:12px;border:1px solid #E2E8F0;
+      }
+      .chip b { color:#1D4ED8; }
+      .study-header { font-weight:600;font-size:18px;margin:6px 0 4px 0; }
+      .ver-badge {
+        display:inline-block;background:#0F172A;color:#fff;border-radius:6px;
+        padding:2px 8px;font-size:12px;margin-left:8px;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"<h2>📈 Canva — Account-Level CLS Dashboard "
+    f"<span class='ver-badge'>{APP_VERSION}</span></h2>",
+    unsafe_allow_html=True,
+)
+
+
+# ----------------------------- Helpers -----------------------------
+def _iso(d):
+    if d is None or pd.isna(d):
+        return None
+    if isinstance(d, (pd.Timestamp, datetime)):
+        return d.strftime("%Y-%m-%d")
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    try:
+        return pd.to_datetime(d).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _parse_mixed(s: pd.Series) -> pd.Series:
+    """Parse a series that may contain Excel serial numbers OR ISO strings."""
+    EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+    num = pd.to_numeric(s, errors="coerce")
+    # Plausible Excel serial range (~1902 to ~2118)
+    is_serial = num.notna() & num.between(1000, 80000)
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if is_serial.any():
+        out.loc[is_serial] = EXCEL_EPOCH + pd.to_timedelta(
+            num[is_serial].astype(float), unit="D"
+        )
+    rest_mask = out.isna() & s.notna()
+    if rest_mask.any():
+        parsed = pd.to_datetime(s[rest_mask].astype(str), errors="coerce")
+        # Reject the 1970-01-01 sentinel — that's epoch garbage, not a real date
+        parsed = parsed.where(parsed != pd.Timestamp("1970-01-01"))
+        out.loc[rest_mask] = parsed
+    return out
+
+
+def parse_date_col(series, yyyymmdd=False):
+    """
+    Robust date parsing.
+    - Excel/Lark serials (days since 1899-12-30) → real dates
+    - ISO/locale strings → real dates
+    - 0, '', None, '0', '—' → NaT (NOT 1970-01-01)
+    """
+    s = series.copy()
+
+    def _blank_to_nan(x):
+        if x is None:
+            return np.nan
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            if pd.isna(x) or float(x) == 0.0:
+                return np.nan
+            return x
+        sx = str(x).strip()
+        if sx in {"", "0", "0.0", "—", "-", "N/A", "n/a", "None", "null", "NaN"}:
+            return np.nan
+        return sx
+
+    s = s.map(_blank_to_nan)
+
+    if yyyymmdd:
+        digits = s.astype(str).str.replace(r"\D", "", regex=True)
+        mask8 = digits.str.len() == 8
+        out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+        if mask8.any():
+            out.loc[mask8] = pd.to_datetime(
+                digits[mask8], format="%Y%m%d", errors="coerce"
+            )
+        remaining = ~mask8 & s.notna()
+        if remaining.any():
+            out.loc[remaining] = _parse_mixed(s[remaining])
+        return out
+
+    return _parse_mixed(s)
+
+
+def _to_num(x):
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip()
+    if s in {"", "—", "-", "N/A", "n/a", "NaN"}:
+        return np.nan
+    s = s.replace(",", "").replace("$", "").replace("%", "")
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def dedupe_columns(cols):
+    """Remove blank columns, suffix duplicates as foo, foo__2, foo__3."""
+    cleaned = []
+    seen = {}
+    drop_idx = []
+    for i, c in enumerate(cols):
+        name = "" if c is None else str(c).strip()
+        if name == "":
+            drop_idx.append(i)
+            cleaned.append(None)
+            continue
+        if name in seen:
+            seen[name] += 1
+            cleaned.append(f"{name}__{seen[name]}")
+        else:
+            seen[name] = 1
+            cleaned.append(name)
+    return cleaned, drop_idx
+
+
+# ----------------------------- Lark URL parsing -----------------------------
+LARK_BASE = "https://open.larkoffice.com/open-apis"
+
+
+def parse_lark_sheet_url(url: str):
+    if not url:
+        return None, None
+    url = url.strip()
+    m = re.search(r"/(?:sheets|wiki)/([A-Za-z0-9]+)", url)
+    token = m.group(1) if m else None
+    sheet_id = None
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "sheet" in qs and qs["sheet"]:
+            sheet_id = qs["sheet"][0]
+        else:
+            frag = parsed.fragment or ""
+            fm = re.search(r"sheet=([A-Za-z0-9]+)", frag)
+            if fm:
+                sheet_id = fm.group(1)
+    except Exception:
+        pass
+    return token, sheet_id
+
+
+def resolve_wiki_to_sheet(token: str, wiki_node_token: str) -> str:
+    r = requests.get(
+        f"{LARK_BASE}/wiki/v2/spaces/get_node",
+        params={"token": wiki_node_token, "obj_type": "wiki"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    js = r.json()
+    if js.get("code") != 0:
+        raise RuntimeError(f"Wiki resolve failed: {js}")
+    return js["data"]["node"]["obj_token"]
+
+
+# ----------------------------- Lark API helpers -----------------------------
+@st.cache_data(ttl=3300, show_spinner=False)
+def get_lark_token(app_id: str, app_secret: str) -> str:
+    r = requests.post(
+        f"{LARK_BASE}/auth/v3/tenant_access_token/internal",
+        json={"app_id": app_id, "app_secret": app_secret},
+        timeout=20,
+    )
+    r.raise_for_status()
+    js = r.json()
+    if js.get("code") != 0:
+        raise RuntimeError(f"Lark auth failed: {js}")
+    return js["tenant_access_token"]
+
+
+def get_sheet_metadata(token: str, sheet_token: str) -> dict:
+    r = requests.get(
+        f"{LARK_BASE}/sheets/v3/spreadsheets/{sheet_token}/sheets/query",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def read_range(token, sheet_token, sheet_id, start_row, end_row, end_col_letter="AZ"):
+    rng = f"{sheet_id}!A{start_row}:{end_col_letter}{end_row}"
+    url = f"{LARK_BASE}/sheets/v2/spreadsheets/{sheet_token}/values/{rng}"
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("code") != 0:
+raise RuntimeError(f"Lark read failed: {js}")
+    return js["data"]["valueRange"]["values"] or []
+
+
+def read_lark_sheet_paginated(token, sheet_token, sheet_id, total_rows, end_col_letter="AZ"):
+    rows = []
+    header = None
+    page_size = 1500
+    cursor = 1
+    progress = st.progress(0.0, text="Reading Lark sheet…")
+    while cursor <= total_rows:
+        end = min(cursor + page_size - 1, total_rows)
+        try:
+            chunk = read_range(token, sheet_token, sheet_id, cursor, end, end_col_letter)
+        except Exception as e:
+            msg = str(e).lower()
+            if ("10mb" in msg or "too large" in msg) and page_size > 100:
+                page_size = max(100, page_size // 2)
+                continue
+            raise
+        if not chunk:
+            break
+        if header is None:
+            header = [str(c).strip() if c is not None else "" for c in chunk[0]]
+            rows.extend(chunk[1:])
+        else:
+            rows.extend(chunk)
+        cursor = end + 1
+        progress.progress(
+            min(1.0, cursor / max(1, total_rows)),
+            text=f"Reading Lark sheet… {cursor:,}/{total_rows:,}",
+        )
+    progress.empty()
+    if not header:
+        return pd.DataFrame()
+
+    width = len(header)
+    rows = [r + [None] * (width - len(r)) if len(r) < width else r[:width] for r in rows]
+
+    cleaned, drop_idx = dedupe_columns(header)
+    if drop_idx:
+        keep = [i for i in range(width) if i not in set(drop_idx)]
+        rows = [[r[i] for i in keep] for r in rows]
+        cleaned = [cleaned[i] for i in keep]
+
+    return pd.DataFrame(rows, columns=cleaned)
+
+
+# ----------------------------- Column normalization -----------------------------
+COLUMN_ALIASES = {
+    "study name": "Study Name",
+    "study_name": "Study Name",
+    "advertiser name": "Advertiser Name",
+    "study id": "Study ID",
+    "study country": "Country",
+    "country": "Country",
+    "region": "Region",
+    "ad type": "Ad Type",
+    "channel": "Channel",
+    "objective": "Objective",
+    "measured event": "Measured Event",
+    "measured_event": "Measured Event",
+    # Date columns — sheet uses "Start Date" / "End Date"
+    "start date": "Study Start Date",
+    "end date": "Study End Date",
+    "study start date": "Study Start Date",
+    "study_start_date": "Study Start Date",
+    "study end date": "Study End Date",
+    "study_end_date": "Study End Date",
+    # Cell sizes
+    "control size": "Control Cell Size",
+    "treatment size": "Test Cell Size",
+    "test cell size": "Test Cell Size",
+    "control cell size": "Control Cell Size",
+    # CVRs
+    "treatment cvr": "Test CVR",
+    "test cvr": "Test CVR",
+    "control cvr": "Control CVR",
+    # Stats
+    "conversion relative lift p-value": "p_value",
+    "p value": "p_value",
+    "pvalue": "p_value",
+    "p-value": "p_value",
+    # Spend / volume
+    "measured spend": "Total Spend",
+    "incremental conversions": "Incremental Conversions",
+}
+
+REGION_MAP = {
+    "US": "NA", "CA": "NA",
+    "GB": "EMEA", "DE": "EMEA", "FR": "EMEA", "ES": "EMEA",
+    "IT": "EMEA", "NL": "EMEA", "SE": "EMEA", "AE": "EMEA",
+    "AU": "APAC", "NZ": "APAC", "JP": "APAC", "KR": "APAC",
+    "SG": "APAC", "HK": "APAC", "TW": "APAC", "ID": "APAC",
+    "BR": "LATAM", "MX": "LATAM", "AR": "LATAM", "CL": "LATAM",
+}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    cleaned, drop_idx = dedupe_columns(list(df.columns))
+    if drop_idx:
+        df = df.drop(df.columns[drop_idx], axis=1)
+        cleaned = [n for i, n in enumerate(cleaned) if i not in set(drop_idx)]
+    df.columns = cleaned
+
+    new_cols = {c: COLUMN_ALIASES.get(str(c).strip().lower(), c) for c in df.columns}
+    df = df.rename(columns=new_cols)
+
+    cleaned2, _ = dedupe_columns(list(df.columns))
+    df.columns = cleaned2
+
+    for dc in ("Study Start Date", "Study End Date"):
+        if dc in df.columns:
+            df[dc] = parse_date_col(df[dc])
+    if "p_date" in df.columns:
+        df["p_date"] = parse_date_col(df["p_date"], yyyymmdd=True)
+
+    for nc in (
+        "Control Conversions Scaled",
+        "Treatment Conversions",
+        "Test Cell Size",
+        "Control Cell Size",
+        "Test CVR",
+        "Control CVR",
+        "p_value",
+        "Total Spend",
+        "Incremental Conversions",
+        "Reach",
+        "Holdout Rate",
+        "Conversion Relative Lift",
+        "Conversion Relative Lift Lower",
+        "Conversion Relative Lift Upper",
+    ):
+        if nc in df.columns:
+            df[nc] = df[nc].apply(_to_num)
+
+    if "Region" not in df.columns and "Country" in df.columns:
+        df["Region"] = df["Country"].astype(str).str.upper().map(REGION_MAP).fillna("Other")
+
+    return df
+
+
+# ----------------------------- Sidebar -----------------------------
+with st.sidebar:
+    st.markdown(f"### Canva CLS Dashboard `{APP_VERSION}`")
+    src = st.radio("Data source", ["Lark Sheet URL", "Excel upload"], index=0)
+
+    df_raw = pd.DataFrame()
+
+    if src == "Lark Sheet URL":
+        app_id = st.text_input("Lark App ID", value=st.session_state.get("app_id", ""))
+        app_secret = st.text_input(
+            "Lark App Secret",
+            value=st.session_state.get("app_secret", ""),
+            type="password",
+        )
+        sheet_url = st.text_input(
+            "Lark Sheet URL",
+            value=st.session_state.get("sheet_url", ""),
+            placeholder="https://bytedance.larkoffice.com/sheets/<TOKEN>?sheet=<SHEET_ID>",
+        )
+        end_col = st.text_input("Last column letter", value="AZ")
+
+        if sheet_url:
+            tok_p, sid_p = parse_lark_sheet_url(sheet_url)
+            st.caption(
+                f"Detected token: `{tok_p or '—'}`  •  "
+                f"sheet id: `{sid_p or '(auto-pick first sheet)'}`"
+            )
+
+        if st.button("Load from Lark URL", use_container_width=True):
+            try:
+                if not (app_id and app_secret and sheet_url):
+                    st.error("Provide App ID, App Secret, and Sheet URL.")
+                else:
+                    sheet_token, url_sheet_id = parse_lark_sheet_url(sheet_url)
+                    if not sheet_token:
+                        st.error("Could not parse spreadsheet token from URL.")
+                    else:
+                        token = get_lark_token(app_id, app_secret)
+
+                        if "/wiki/" in sheet_url:
+                            try:
+                                sheet_token = resolve_wiki_to_sheet(token, sheet_token)
+                                st.caption(f"Resolved wiki → sheet token `{sheet_token}`")
+                            except Exception as e:
+                                st.warning(f"Wiki resolve failed; trying token as-is. ({e})")
+
+                        meta = get_sheet_metadata(token, sheet_token)
+                        sheets = meta.get("data", {}).get("sheets", [])
+                        if not sheets:
+                            st.error("No sheets found in spreadsheet.")
+                        else:
+                            chosen = None
+                            if url_sheet_id:
+                                chosen = next(
+                                    (s for s in sheets if s.get("sheet_id") == url_sheet_id),
+                                    None,
+                                )
+                            chosen = chosen or sheets[0]
+                            sid = chosen["sheet_id"]
+                            total_rows = chosen.get("grid_properties", {}).get("row_count", 1000)
+                            st.caption(
+                                f"Loading sheet **{chosen.get('title','(untitled)')}** "
+                                f"(`{sid}`) — {total_rows:,} rows"
+                            )
+                            df_raw = read_lark_sheet_paginated(
+                                token, sheet_token, sid, total_rows, end_col
+                            )
+                            st.session_state["df_raw"] = df_raw
+                            st.session_state["app_id"] = app_id
+                            st.session_state["app_secret"] = app_secret
+                            st.session_state["sheet_url"] = sheet_url
+                            st.success(f"Loaded {len(df_raw):,} rows.")
+            except Exception as e:
+                st.error(f"Lark load error: {e}")
+    else:
+        up = st.file_uploader("Upload .xlsx", type=["xlsx"])
+        if up is not None:
+            try:
+                df_raw = pd.read_excel(up)
+                st.session_state["df_raw"] = df_raw
+                st.success(f"Loaded {len(df_raw):,} rows.")
+            except Exception as e:
+                st.error(f"Excel error: {e}")
+
+    df_raw = st.session_state.get("df_raw", df_raw)
+    df = normalize_columns(df_raw.copy()) if not df_raw.empty else pd.DataFrame()
+
+    st.markdown("---")
+    st.markdown("### Filters")
+    fdf = df.copy()
+    if not fdf.empty:
+        if "Region" in fdf.columns:
+            regions = sorted([x for x in fdf["Region"].dropna().unique().tolist() if x != ""])
+            sel = st.multiselect("Region", regions, default=regions)
+            if sel:
+                fdf = fdf[fdf["Region"].isin(sel)]
+        if "Channel" in fdf.columns:
+            chans = sorted([x for x in fdf["Channel"].dropna().unique().tolist() if x != ""])
+            sel = st.multiselect("Channel", chans, default=chans)
+            if sel:
+                fdf = fdf[fdf["Channel"].isin(sel)]
+        if "Objective" in fdf.columns:
+            objs = sorted([x for x in fdf["Objective"].dropna().unique().tolist() if x != ""])
+            sel = st.multiselect("Objective", objs, default=objs)
+            if sel:
+                fdf = fdf[fdf["Objective"].isin(sel)]
+        if "Study Name" in fdf.columns:
+            studies = sorted([x for x in fdf["Study Name"].dropna().unique().tolist() if x != ""])
+            sel = st.multiselect("Study Name", studies, default=studies)
+            if sel:
+                fdf = fdf[fdf["Study Name"].isin(sel)]
+
+
+# ----------------------------- Hero metrics -----------------------------
+def compute_hero(_df: pd.DataFrame, preferred_event: str = "start_trial") -> dict:
+    out = {"studies": 0, "sig": 0, "lift_avg": np.nan, "p_med": np.nan}
+    if _df.empty or "Study Name" not in _df.columns:
+        return out
+    base = _df.copy()
+    if "Measured Event" in base.columns:
+        m = base["Measured Event"].astype(str).str.strip().str.lower() == preferred_event
+        if m.any():
+            base = base[m]
+    out["studies"] = base["Study Name"].nunique()
+    if "p_value" in base.columns:
+        agg = base.groupby("Study Name")["p_value"].min()
+        out["sig"] = int((agg <= 0.1).sum())
+        out["p_med"] = float(agg.median()) if len(agg) else np.nan
+    if {"Test CVR", "Control CVR"}.issubset(base.columns):
+        lift = (base["Test CVR"] - base["Control CVR"]) / base["Control CVR"].replace(0, np.nan)
+        out["lift_avg"] = float(lift.mean()) if lift.notna().any() else np.nan
+    return out
+
+
+# ----------------------------- Tabs -----------------------------
+if df.empty:
+    st.info("Paste a Lark Sheet URL (with App ID/Secret) or upload an Excel to begin.")
+    st.stop()
+
+tab_summary, tab_studies, tab_raw, tab_monday = st.tabs(
+    ["Summary", "Study Table", "Raw Data", "Monday Export"]
+)
+
+# ============================ SUMMARY ============================
+with tab_summary:
+    hero = compute_hero(fdf)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("Studies", f"{hero['studies']:,}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("Significant (p ≤ 0.1)", f"{hero['sig']:,}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        v = hero["lift_avg"]
+        st.metric("Avg Lift", f"{v*100:.2f}%" if pd.notna(v) else "—")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c4:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        v = hero["p_med"]
+        st.metric("Median p-value", f"{v:.3f}" if pd.notna(v) else "—")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("#### Per-Study Conversions Over Time (start_trial)")
+
+    X_COL = "p_date"
+    CTRL_COL = "Control Conversions Scaled"
+    TRT_COL = "Treatment Conversions"
+
+    needed = {
+        X_COL,
+        CTRL_COL,
+        TRT_COL,
+        "Measured Event",
+        "Study Name",
+        "Study Start Date",
+        "Study End Date",
+    }
+    missing = [c for c in needed if c not in fdf.columns]
+    if missing:
+        st.warning(f"Missing columns required for charts: {missing}")
+    else:
+        plot_df = fdf[
+            fdf["Measured Event"].astype(str).str.strip().str.lower() == "start_trial"
+        ].copy()
+
+        if plot_df.empty:
+            st.info("No rows with Measured Event = 'start_trial' after filters.")
+        else:
+            for idx, (study, sdf) in enumerate(plot_df.groupby("Study Name")):
+                start = sdf["Study Start Date"].min()
+                end = sdf["Study End Date"].max()
+                start_iso = _iso(start)
+                end_iso = _iso(end)
+
+                # Skip if window is invalid or epoch garbage
+                bad_window = (
+                    pd.isna(start)
+                    or pd.isna(end)
+                    or start == pd.Timestamp("1970-01-01")
+                    or end == pd.Timestamp("1970-01-01")
+                )
+                if bad_window:
+                    st.markdown(
+                        f"<div class='study-header'>{study}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"⚠️ **{study}** has no valid Start/End Date — skipping chart."
+                    )
+                    continue
+
+                ts = sdf.dropna(subset=[X_COL]).copy()
+                ts = ts[ts[X_COL] >= pd.to_datetime(start)]
+                ts = ts[ts[X_COL] <= pd.to_datetime(end)]
+
+                ts = (
+                    ts.groupby(X_COL, as_index=False)
+                    .agg({CTRL_COL: "sum", TRT_COL: "sum"})
+                    .sort_values(X_COL)
+                )
+
+                full_range = pd.date_range(
+                    pd.to_datetime(start), pd.to_datetime(end), freq="D"
+                )
+                ts = (
+                    ts.set_index(X_COL)
+                    .reindex(full_range)
+                    .rename_axis(X_COL)
+                    .reset_index()
+                )
+
+                st.markdown(
+                    f"<div class='study-header'>{study}"
+                    f" &nbsp;<span style='color:#64748B;font-weight:400;font-size:13px;'>"
+                    f"{start_iso} → {end_iso}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+                if ts[CTRL_COL].dropna().empty and ts[TRT_COL].dropna().empty:
+                    st.caption(f"No start_trial rows for **{study}** in window.")
+                    continue
+
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+x=ts[X_COL],
+                        y=ts[CTRL_COL],
+                        mode="lines+markers",
+                        name="Control Conversions Scaled",
+                        line=dict(color="#1F77B4", width=2),
+                        marker=dict(size=5),
+                        connectgaps=True,
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=ts[X_COL],
+                        y=ts[TRT_COL],
+                        mode="lines+markers",
+                        name="Treatment Conversions",
+                        line=dict(color="#FF7F0E", width=2),
+                        marker=dict(size=5),
+                        connectgaps=True,
+                    )
+                )
+
+                fig.add_shape(
+                    type="line",
+                    x0=start_iso, x1=start_iso,
+                    yref="paper", y0=0, y1=1,
+                    line=dict(color="#16A34A", width=1, dash="dash"),
+                )
+                fig.add_annotation(
+                    x=start_iso, y=1, yref="paper",
+                    text="Start", showarrow=False,
+                    font=dict(color="#16A34A", size=11),
+                    xanchor="left", yanchor="bottom",
+                )
+                fig.add_shape(
+                    type="line",
+                    x0=end_iso, x1=end_iso,
+                    yref="paper", y0=0, y1=1,
+                    line=dict(color="#DC2626", width=1, dash="dash"),
+                )
+                fig.add_annotation(
+                    x=end_iso, y=1, yref="paper",
+                    text="End", showarrow=False,
+                    font=dict(color="#DC2626", size=11),
+                    xanchor="right", yanchor="bottom",
+                )
+
+                fig.update_layout(
+                    height=360,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis=dict(
+                        title="p_date",
+                        type="date",
+                        showgrid=True,
+                        gridcolor="#EEF0F3",
+                        range=[start_iso, end_iso],
+                    ),
+                    yaxis=dict(
+                        title="Conversions",
+                        showgrid=True,
+                        gridcolor="#EEF0F3",
+                    ),
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom", y=1.02,
+                        xanchor="right", x=1,
+                    ),
+                    plot_bgcolor="#FFFFFF",
+                    paper_bgcolor="#FFFFFF",
+                )
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key=f"summary_chart_{idx}_{study}",
+                )
+
+# ============================ STUDY TABLE ============================
+CRITERIA_FIELDS = [
+    "Country",
+    "Region",
+    "Channel",
+    "Objective",
+    "Ad Type",
+    "Measured Event",
+    "Study Start Date",
+    "Study End Date",
+]
+
+
+def render_study_criteria(sdf: pd.DataFrame):
+    chips = []
+    for f in CRITERIA_FIELDS:
+        if f in sdf.columns:
+            vals = sdf[f].dropna().astype(str).unique().tolist()
+            if vals:
+                v = ", ".join(sorted(set(vals))[:4])
+                chips.append(f"<span class='chip'><b>{f}</b>: {v}</span>")
+    st.markdown("".join(chips), unsafe_allow_html=True)
+
+
+with tab_studies:
+    if "Study Name" not in fdf.columns:
+        st.info("No Study Name column.")
+    else:
+        agg_dict = {}
+        for c in (
+            "Control Conversions Scaled",
+            "Treatment Conversions",
+            "Test Cell Size",
+            "Control Cell Size",
+        ):
+            if c in fdf.columns:
+                agg_dict[c] = "sum"
+        for c in ("Test CVR", "Control CVR", "p_value"):
+            if c in fdf.columns:
+                agg_dict[c] = "mean"
+        if agg_dict:
+            tbl = fdf.groupby("Study Name", as_index=False).agg(agg_dict)
+            if {"Test CVR", "Control CVR"}.issubset(tbl.columns):
+                tbl["Lift %"] = (
+                    (tbl["Test CVR"] - tbl["Control CVR"])
+                    / tbl["Control CVR"].replace(0, np.nan)
+                ) * 100
+            if "p_value" in tbl.columns:
+                tbl["Confidence"] = (1 - tbl["p_value"]) * 100
+            st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### Study Criteria")
+        for study, sdf in fdf.groupby("Study Name"):
+            st.markdown(f"**{study}**")
+            render_study_criteria(sdf)
+            st.markdown("")
+
+# ============================ RAW DATA ============================
+with tab_raw:
+    safe_cols, drop_idx = dedupe_columns(list(fdf.columns))
+    fdf_safe = fdf.copy()
+    if drop_idx:
+        fdf_safe = fdf_safe.drop(fdf_safe.columns[drop_idx], axis=1)
+        safe_cols = [n for i, n in enumerate(safe_cols) if i not in set(drop_idx)]
+    fdf_safe.columns = safe_cols
+
+    st.dataframe(fdf_safe, use_container_width=True, hide_index=True)
+    csv_bytes = fdf_safe.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        csv_bytes,
+        file_name=f"cls_raw_{datetime.now():%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+    )
+
+# ============================ MONDAY EXPORT ============================
+MONDAY_COLUMNS = [
+    "Study Name", "Status", "Owner", "Region", "Country", "Channel",
+    "Objective", "Ad Type", "Measured Event", "Study Start Date",
+    "Study End Date", "Test Cell Size", "Control Cell Size", "Test CVR",
+    "Control CVR", "Lift %", "p_value", "Confidence", "Significant",
+    "Spend (Test)", "Spend (Control)", "Total Spend",
+    "Incremental Conversions", "Cost per Trial", "Cost per Sign-up",
+    "Notes", "Brief Link", "Dashboard Link", "Slack Channel",
+    "PMM Lead", "Marketing Science Lead",
+    "Data Analyst (remove once team has access))",
+    "Creative Lead", "Media Buyer", "Region Lead", "Reviewed?",
+    "Reviewed Date", "Reviewed By", "Reporting Quarter", "Fiscal Year",
+    "Tags", "Confidential", "Last Updated",
+]
+
+
+def _cost_for_event(
+    sdf: pd.DataFrame,
+    event_name: str,
+    spend_col: str = "Total Spend",
+    inc_col: str = "Incremental Conversions",
+) -> float:
+    if "Measured Event" not in sdf.columns:
+        return np.nan
+    m = sdf["Measured Event"].astype(str).str.strip().str.lower() == event_name.lower()
+    sub = sdf[m]
+    if sub.empty or spend_col not in sub.columns or inc_col not in sub.columns:
+        return np.nan
+    spend = pd.to_numeric(sub[spend_col], errors="coerce").sum()
+    inc = pd.to_numeric(sub[inc_col], errors="coerce").sum()
+    if not inc or pd.isna(inc) or inc == 0:
+        return np.nan
+    return float(spend) / float(inc)
+
+
+with tab_monday:
+    st.markdown("#### Monday.com export (42 columns)")
+    rows = []
+    for study, sdf in fdf.groupby("Study Name"):
+        row = {c: "" for c in MONDAY_COLUMNS}
+        row["Study Name"] = study
+        for f in (
+            "Region",
+            "Country",
+            "Channel",
+            "Objective",
+            "Ad Type",
+            "Measured Event",
+        ):
+            if f in sdf.columns:
+                vals = sdf[f].dropna().astype(str).unique().tolist()
+                row[f] = ", ".join(sorted(set(vals)))
+        if "Study Start Date" in sdf.columns:
+            row["Study Start Date"] = _iso(sdf["Study Start Date"].min()) or ""
+        if "Study End Date" in sdf.columns:
+            row["Study End Date"] = _iso(sdf["Study End Date"].max())or ""
+        for f in ("Test Cell Size", "Control Cell Size"):
+            if f in sdf.columns:
+                row[f] = pd.to_numeric(sdf[f], errors="coerce").sum()
+        for f in ("Test CVR", "Control CVR"):
+            if f in sdf.columns:
+                row[f] = pd.to_numeric(sdf[f], errors="coerce").mean()
+        if (
+            isinstance(row["Test CVR"], (int, float))
+            and isinstance(row["Control CVR"], (int, float))
+            and row["Control CVR"]
+        ):
+            row["Lift %"] = (
+                (row["Test CVR"] - row["Control CVR"]) / row["Control CVR"] * 100
+            )
+        if "p_value" in sdf.columns:
+            pv = pd.to_numeric(sdf["p_value"], errors="coerce").min()
+            row["p_value"] = pv
+            row["Confidence"] = (1 - pv) * 100 if pd.notna(pv) else ""
+            row["Significant"] = "Yes" if pd.notna(pv) and pv <= 0.1 else "No"
+        if "Total Spend" in sdf.columns:
+            row["Total Spend"] = pd.to_numeric(sdf["Total Spend"], errors="coerce").sum()
+        if "Incremental Conversions" in sdf.columns:
+            row["Incremental Conversions"] = pd.to_numeric(
+                sdf["Incremental Conversions"], errors="coerce"
+            ).sum()
+        row["Cost per Trial"] = _cost_for_event(sdf, "start_trial")
+        row["Cost per Sign-up"] = _cost_for_event(sdf, "on_web_register")
+        row["Last Updated"] = datetime.now().strftime("%Y-%m-%d")
+        rows.append(row)
+
+    monday_df = pd.DataFrame(rows, columns=MONDAY_COLUMNS)
+    st.dataframe(monday_df, use_container_width=True, hide_index=True)
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        monday_df.to_excel(w, index=False, sheet_name="Monday")
+    st.download_button(
+        "Download Monday Export (.xlsx)",
+        out.getvalue(),
+        file_name=f"monday_export_{datetime.now():%Y%m%d_%H%M}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
