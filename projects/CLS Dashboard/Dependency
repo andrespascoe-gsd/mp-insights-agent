@@ -1,1 +1,15 @@
+#PASTE THIS INTO TERMINAL FIRST
 
+
+export LARK_APP_ID="cli_a9701e4e75ac9cd4"
+export LARK_APP_SECRET="wxiJZocquKpseOLgKYUYZd0XYFO8w3fv"
+
+
+#THEN PASTE THIS
+
+
+PYTHONUNBUFFERED=1 \
+PYTHONFAULTHANDLER=1 \
+/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m streamlit run /Users/bytedance/Desktop/canva_account_level_CLS_Dashboard_v4.1.py \
+--logger.level=debug \
+--server.runOnSave=true
