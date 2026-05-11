@@ -8,11 +8,76 @@ import io, os, json, warnings
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
+
+# Compatibility patches for causalimpact 0.2.6 + pandas 2.0+ + Python 3.14
+if not hasattr(pd.core.dtypes.common, 'is_datetime_or_timedelta_dtype'):
+    pd.core.dtypes.common.is_datetime_or_timedelta_dtype = (
+        lambda x: pd.api.types.is_datetime64_any_dtype(x) or pd.api.types.is_timedelta64_dtype(x)
+    )
+
+# Patch causalimpact.misc.standardize_all_variables — uses series[0] broken in pandas 2.0+
+# Original returns {"data_pre": ..., "data_post": ..., "orig_std_params": (mu, sd)}
+# Bug: data_mu[0] / data_sd[0] use label lookup in pandas 2.x, need .iloc[0]
+try:
+    import causalimpact.misc as _ci_misc
+    import causalimpact.analysis as _ci_analysis
+
+    def _patched_standardize(data, pre_period, post_period):
+        if not isinstance(data, pd.DataFrame):
+            raise ValueError("``data`` must be of type `pandas.DataFrame`")
+        data_mu = data.loc[pre_period[0]:pre_period[1], :].mean(skipna=True)
+        data_sd = data.loc[pre_period[0]:pre_period[1], :].std(skipna=True, ddof=0)
+        data = data - data_mu
+        data_sd = data_sd.fillna(1)
+        data[data != 0] = data[data != 0] / data_sd
+        y_mu = data_mu.iloc[0]
+        y_sd = data_sd.iloc[0]
+        data_pre  = data.loc[pre_period[0]:pre_period[1], :]
+        data_post = data.loc[post_period[0]:post_period[1], :]
+        return {"data_pre": data_pre, "data_post": data_post, "orig_std_params": (y_mu, y_sd)}
+
+    _ci_misc.standardize_all_variables = _patched_standardize
+    _ci_analysis.standardize_all_variables = _patched_standardize
+except Exception as _e:
+    print(f"causalimpact patch warning: {_e}")
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from openai import OpenAI
 
 warnings.filterwarnings("ignore")
+
+
+def _safe_json_loads(raw: str):
+    """Parse JSON from LLM output, escaping any bare control characters inside string values."""
+    # First strip markdown fences if present
+    s = raw.strip()
+    if s.startswith("```"):
+        parts = s.split("```")
+        s = parts[1] if len(parts) > 1 else s
+        if s.startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    # Walk the string and escape control chars that appear inside JSON string values
+    out = []
+    in_str = False
+    escaped = False
+    _ESC = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
+    for ch in s:
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == '\\' and in_str:
+            out.append(ch)
+            escaped = True
+        elif ch == '"':
+            out.append(ch)
+            in_str = not in_str
+        elif in_str and (ord(ch) < 0x20):
+            out.append(_ESC.get(ch, f'\\u{ord(ch):04x}'))
+        else:
+            out.append(ch)
+    return json.loads(''.join(out))
 
 ARK_BASE_URL = "https://api.groq.com/openai/v1/"
 OPENAI_DEFAULT_MODEL = "llama-3.3-70b-versatile"
@@ -406,8 +471,8 @@ EXAMPLE RESPONSE:
         r = client.chat.completions.create(
             model=endpoint_id, messages=messages, temperature=0.15, max_tokens=500
         )
-        raw = r.choices[0].message.content.strip().replace("json","").replace("","").strip()
-        spec = json.loads(raw)
+        raw = r.choices[0].message.content.strip()
+        spec = _safe_json_loads(raw)
         return spec, None
     except json.JSONDecodeError as je:
         return {"chart_type": "text", "message": f"I couldn't parse the response into a chart spec ({je}). Try rephrasing."}, None
@@ -831,8 +896,18 @@ def get_suggested_prompts(hypothesis, conv_cols_sot, sess_cols_sot, channels):
     return dedup(standard)[:4], dedup(advanced)[:5]
 
 
-def fetch_google_trends(keywords, start_date, end_date):
+GEO_OPTIONS = {
+    "Australia (AU)":     ("en-AU", 600,  "AU"),
+    "New Zealand (NZ)":   ("en-NZ", 720,  "NZ"),
+    "United States (US)": ("en-US", -300, "US"),
+    "United Kingdom (UK)":("en-GB", 0,    "GB"),
+    "Singapore (SG)":     ("en-SG", 480,  "SG"),
+    "Global":             ("en-US", 0,    ""),
+}
+
+def fetch_google_trends(keywords, start_date, end_date, geo_label="Australia (AU)"):
     """Fetch Google Trends. Auto-installs pytrends if missing."""
+    hl, tz, geo_code = GEO_OPTIONS.get(geo_label, ("en-AU", 600, "AU"))
     try:
         from pytrends.request import TrendReq
     except ImportError:
@@ -844,10 +919,10 @@ def fetch_google_trends(keywords, start_date, end_date):
         except Exception as ie:
             return None, f"Could not install pytrends: {ie}. Run manually: pip install pytrends"
     try:
-        pytrends = TrendReq(hl="en-AU", tz=600, timeout=(10, 25))
+        pytrends = TrendReq(hl=hl, tz=tz, timeout=(10, 25))
         tf = f"{start_date.strftime('%Y-%m-%d')} {end_date.strftime('%Y-%m-%d')}"
         kws = [k.strip() for k in keywords if k.strip()][:5]
-        pytrends.build_payload(kws, timeframe=tf, geo="AU")
+        pytrends.build_payload(kws, timeframe=tf, geo=geo_code)
         df_trends = pytrends.interest_over_time()
         if df_trends.empty:
             return None, "No trend data returned — Google Trends may have throttled the request. Wait 60 seconds and try again, or try broader keywords."
@@ -862,6 +937,308 @@ def fetch_google_trends(keywords, start_date, end_date):
 
 
 
+# ── CausalImpact Model Functions ──────────────────────────────────────────────
+
+def run_causal_impact(df, target, covariates, pre_start, pre_end, post_start, post_end):
+    """Run BSTS CausalImpact model."""
+    try:
+        from causalimpact import CausalImpact
+    except ImportError:
+        return None, "causalimpact not installed. Run: pip3 install causalimpact"
+    try:
+        cols = [target] + [c for c in covariates if c in df.columns and c != target]
+        ci_df = df[['p_date'] + cols].copy().set_index('p_date')
+        ci_df.index = pd.to_datetime(ci_df.index)
+        ci_df = ci_df.sort_index()
+        full_idx = pd.date_range(ci_df.index.min(), ci_df.index.max(), freq='D')
+        ci_df = ci_df.reindex(full_idx, fill_value=0)
+        ci_df.index.name = 'date'
+        for col in ci_df.columns:
+            ci_df[col] = ci_df[col].astype(float)
+
+        pre  = [str(pd.Timestamp(pre_start).date()),  str(pd.Timestamp(pre_end).date())]
+        post = [str(pd.Timestamp(post_start).date()), str(pd.Timestamp(post_end).date())]
+
+        # Try with nseasons first, fall back to no model_args
+        try:
+            ci = CausalImpact(ci_df, pre, post, model_args={'niter': 1000, 'nseasons': 7})
+        except Exception:
+            try:
+                ci = CausalImpact(ci_df, pre, post, model_args={'niter': 1000})
+            except Exception:
+                ci = CausalImpact(ci_df, pre, post)
+
+        # Call run() explicitly — required by jamalsenouci/causalimpact v0.2.x
+        ci.run()
+
+        # Compute p-value directly from inferences (ci.summary() prints to stdout
+        # and returns None in jamalsenouci/causalimpact v0.2.x, so regex parsing fails)
+        try:
+            import scipy.stats as _st
+            post_inf = ci.inferences.loc[post_start:post_end]
+            mean_pred  = float(post_inf['point_pred'].mean())
+            mean_upper = float(post_inf['point_pred_upper'].mean())
+            std_pred   = (mean_upper - mean_pred) / 1.96
+            if std_pred > 0:
+                z_score = (0 - mean_pred) / std_pred
+                ci._extracted_p_value = float(_st.norm.cdf(z_score))
+            else:
+                ci._extracted_p_value = None
+        except Exception as pe:
+            print(f"p-value extraction error: {pe}")
+            ci._extracted_p_value = None
+
+        if not hasattr(ci, 'inferences') or ci.inferences is None or list(ci.inferences.columns) == list(ci_df.columns):
+            return None, "Model ran but produced no predictions. Check terminal for details."
+
+        return ci, None
+
+    except BaseException as e:
+        import traceback as tb
+        full = tb.format_exc()
+        print("=== CausalImpact error ===\n" + full)
+        lines = [l.strip() for l in full.strip().split("\n") if l.strip()]
+        return None, lines[-1] if lines else str(e)
+
+
+def compute_pre_ape_table(ci, pre_start, pre_end):
+    """Daily APE table for pre-period — matches R CALM output exactly."""
+    s = getattr(ci, 'inferences', None)
+    if s is None:
+        return pd.DataFrame({'Date': [], 'Observed': [], 'Predicted': [], 'APE (%)': []}), 0.0
+    mask = (s.index >= pd.Timestamp(pre_start)) & (s.index <= pd.Timestamp(pre_end))
+    pre  = s[mask].copy()
+    # Python causalimpact uses 'y' and 'y_pred'; R used 'response' and 'point.pred'
+    obs_col  = next((c for c in ['y', 'response', 'observed', 'actual']       if c in pre.columns), None)
+    pred_col = next((c for c in ['y_pred', 'point_pred', 'predicted', 'yhat'] if c in pre.columns), None)
+    if obs_col is None or pred_col is None:
+        print(f"=== inferences columns: {list(pre.columns)} ===")
+        print(f"=== ci attributes: {[a for a in dir(ci) if not a.startswith('_')]} ===")
+        for attr in ['results','series','data','posterior','trace','predictions','model']:
+            val = getattr(ci, attr, None)
+            if val is not None:
+                if hasattr(val, 'columns'): print(f"=== ci.{attr} columns: {list(val.columns)} ===")
+                elif hasattr(val, 'keys'):  print(f"=== ci.{attr} keys: {list(val.keys())} ===")
+                else: print(f"=== ci.{attr}: {type(val).__name__} ===")
+        return pd.DataFrame({'Date': [], 'Observed': [], 'Predicted': [], 'APE (%)': []}), 0.0
+    obs  = pre[obs_col].values
+    pred = pre[pred_col].values
+    denom = np.abs(obs); denom[denom == 0] = np.nan
+    ape  = np.abs(obs - pred) / denom * 100
+    tbl  = pd.DataFrame({
+        'Date':      pre.index.strftime('%Y-%m-%d'),
+        'Observed':  np.round(obs, 2),
+        'Predicted': np.round(pred, 2),
+        'APE (%)':   np.round(ape, 2),
+    })
+    mape = float(np.nanmean(ape))
+    return tbl, mape
+
+
+def build_three_panel_chart(ci, post_start, target_name):
+    """Light-mode three-panel CausalImpact chart with dynamic column detection."""
+    s = ci.inferences.copy()
+    for col in s.columns:
+        try: s[col] = pd.to_numeric(s[col], errors='coerce')
+        except: pass
+
+    dates_str = [str(d)[:10] for d in s.index]
+    post_mask = s.index >= pd.Timestamp(post_start)
+
+    obs_col  = next((c for c in ['y','response','observed','actual']        if c in s.columns), None)
+    pred_col = next((c for c in ['y_pred','point_pred','predicted','yhat']  if c in s.columns), None)
+    pred_lo  = next((c for c in ['y_pred_lower','point_pred_lower']         if c in s.columns), None)
+    pred_hi  = next((c for c in ['y_pred_upper','point_pred_upper']         if c in s.columns), None)
+    eff_col  = next((c for c in ['point_effect','y_effect','effect']        if c in s.columns), None)
+    eff_lo   = next((c for c in ['point_effect_lower','y_effect_lower']     if c in s.columns), None)
+    eff_hi   = next((c for c in ['point_effect_upper','y_effect_upper']     if c in s.columns), None)
+
+    if eff_col is None and obs_col and pred_col:
+        s['_effect'] = s[obs_col] - s[pred_col]
+        eff_col = '_effect'
+
+    cum_eff = pd.Series(np.nan, index=s.index)
+    if eff_col:
+        _c = s[eff_col].copy().astype(float); _c[~post_mask] = 0
+        _c = _c.cumsum().astype(float); _c[~post_mask] = np.nan
+        cum_eff = _c
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        subplot_titles=["Original", "Pointwise Effect", "Cumulative Effect"],
+                        vertical_spacing=0.07)
+
+    if pred_lo and pred_hi:
+        # Clip CI bands to ±3x actual data range to prevent huge bands dominating chart
+        if obs_col:
+            actual_range = float(s[obs_col].abs().max()) * 3
+            s[pred_hi] = s[pred_hi].clip(-actual_range, actual_range)
+            s[pred_lo] = s[pred_lo].clip(-actual_range, actual_range)
+        fig.add_trace(go.Scatter(x=dates_str+dates_str[::-1],
+            y=s[pred_hi].tolist()+s[pred_lo].tolist()[::-1],
+            fill="toself", fillcolor="rgba(124,58,237,0.12)", line=dict(width=0),
+            showlegend=False, hoverinfo="skip"), row=1, col=1)
+    if pred_col:
+        fig.add_trace(go.Scatter(x=dates_str, y=s[pred_col].tolist(),
+            line=dict(color="#7C3AED", width=2, dash="dash"), name="Predicted"), row=1, col=1)
+    if obs_col:
+        fig.add_trace(go.Scatter(x=dates_str, y=s[obs_col].tolist(),
+            line=dict(color="#059669", width=2.5), name=f"Actual ({target_name})"), row=1, col=1)
+
+    if eff_lo and eff_hi:
+        if eff_col:
+            eff_range = float(s[eff_col].abs().max()) * 3 if s[eff_col].abs().max() > 0 else 1000
+            s[eff_hi] = s[eff_hi].clip(-eff_range, eff_range)
+            s[eff_lo] = s[eff_lo].clip(-eff_range, eff_range)
+        fig.add_trace(go.Scatter(x=dates_str+dates_str[::-1],
+            y=s[eff_hi].tolist()+s[eff_lo].tolist()[::-1],
+            fill="toself", fillcolor="rgba(220,38,38,0.10)", line=dict(width=0),
+            showlegend=False, hoverinfo="skip"), row=2, col=1)
+    if eff_col:
+        fig.add_trace(go.Scatter(x=dates_str, y=s[eff_col].tolist(),
+            line=dict(color="#DC2626", width=2), name="Daily effect"), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="#9CA3AF", width=1, dash="dot"), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=dates_str, y=cum_eff.tolist(),
+        line=dict(color="#D97706", width=2), name="Cumulative effect"), row=3, col=1)
+    fig.add_hline(y=0, line=dict(color="#9CA3AF", width=1, dash="dot"), row=3, col=1)
+
+    ps = str(post_start)[:10]
+    for row in [1, 2, 3]:
+        fig.add_vline(x=ps, line=dict(color="#059669", width=1.5, dash="dot"), row=row, col=1)
+
+    fig.update_layout(
+        paper_bgcolor="#FFFFFF", plot_bgcolor="#F7F7FB",
+        font=dict(color="#1A1A2E", family="Inter, Arial, sans-serif", size=12),
+        height=660, showlegend=True,
+        legend=dict(bgcolor="#FFFFFF", bordercolor="#E2DEEF", borderwidth=1, orientation="h", y=-0.06),
+        margin=dict(l=55, r=30, t=50, b=60),
+    )
+    for i in range(1, 4):
+        fig.update_xaxes(gridcolor="#E2DEEF", showgrid=True, zeroline=False, row=i, col=1)
+        fig.update_yaxes(gridcolor="#E2DEEF", showgrid=True, zeroline=False, row=i, col=1)
+    return fig
+
+def build_diagnostic_signals(ci, pre_ape_df, mape, p_value, pre_start, pre_end, post_start, post_end):
+    """Deterministic signal detection. Returns structured list for LLM synthesis."""
+    signals = []
+
+    # 1. MAPE
+    if mape > 15:
+        signals.append({"type": "high_mape", "severity": "critical", "value": round(mape, 2),
+                         "message": f"MAPE is {mape:.1f}% — poor pre-period fit. Predictions are unreliable."})
+    elif mape > 10:
+        signals.append({"type": "high_mape", "severity": "warning", "value": round(mape, 2),
+                         "message": f"MAPE is {mape:.1f}% — borderline fit. Review high-APE dates."})
+
+    # 2. P-value
+    if p_value is not None:
+        if p_value > 0.1:
+            signals.append({"type": "not_significant", "severity": "critical", "value": round(p_value, 4),
+                             "message": f"p={p_value:.4f} — result is not statistically significant."})
+        elif p_value > 0.05:
+            signals.append({"type": "marginal_significance", "severity": "warning", "value": round(p_value, 4),
+                             "message": f"p={p_value:.4f} — marginally significant. Interpret with caution."})
+
+    # 3. High-APE date clusters
+    if 'APE (%)' in pre_ape_df.columns:
+        high = pre_ape_df[pre_ape_df['APE (%)'] > 25].copy()
+        if len(high) >= 3:
+            worst = high.nlargest(3, 'APE (%)')[['Date', 'APE (%)']].to_dict('records')
+            signals.append({"type": "high_ape_cluster", "severity": "warning", "count": len(high),
+                             "top_dates": worst,
+                             "message": f"{len(high)} days with APE > 25% — possible structural break or anomaly window."})
+        elif len(high) > 0:
+            worst = high.nlargest(len(high), 'APE (%)')[['Date', 'APE (%)']].to_dict('records')
+            signals.append({"type": "high_ape_dates", "severity": "info", "top_dates": worst,
+                             "message": f"{len(high)} day(s) with APE > 25%."})
+
+    # 4. Pre-period length
+    pre_days  = (pd.Timestamp(pre_end)  - pd.Timestamp(pre_start)).days  + 1
+    post_days = (pd.Timestamp(post_end) - pd.Timestamp(post_start)).days + 1
+    ratio = pre_days / max(post_days, 1)
+    if pre_days < 30:
+        signals.append({"type": "short_pre_period", "severity": "warning", "value": pre_days,
+                         "message": f"Pre-period is only {pre_days} days — minimum recommended is 30."})
+    elif ratio < 2:
+        signals.append({"type": "low_pre_post_ratio", "severity": "info", "value": round(ratio, 1),
+                         "message": f"Pre/post ratio is {ratio:.1f}× (recommended ≥ 2×)."})
+
+    # 5. CI crossing zero in post-period
+    try:
+        post_s = ci.inferences[ci.inferences.index >= pd.Timestamp(post_start)]
+        lo_col = next((c for c in ['point_effect_lower','y_pred_lower'] if c in post_s.columns), None)
+        hi_col = next((c for c in ['point_effect_upper','y_pred_upper'] if c in post_s.columns), None)
+        if lo_col and hi_col:
+            cross_pct = ((post_s[lo_col] < 0) & (post_s[hi_col] > 0)).mean()
+            if cross_pct > 0.4:
+                signals.append({"type": "ci_crosses_zero", "severity": "warning",
+                                 "value": round(cross_pct * 100, 1),
+                                 "message": f"95% CI crosses zero on {cross_pct*100:.0f}% of post-period days — effect direction uncertain."})
+    except Exception:
+        pass
+
+    return signals
+
+
+def call_llm_diagnostic(signals, context):
+    """Send structured signals to Groq → returns ranked diagnosis + fixes."""
+    if not signals:
+        return None
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY", "")
+        if not api_key: return None
+        client = OpenAI(base_url=ARK_BASE_URL, api_key=api_key)
+        system = """You are a senior causal inference analyst specialising in BSTS/CausalImpact for digital advertising measurement.
+You receive structured diagnostic signals from a model run and return a concise, actionable diagnosis.
+Output ONLY valid JSON — no markdown, no preamble.
+Schema: {"headline":"One-sentence summary","diagnosis":"2-3 sentences explaining the specific cause referencing dates/values from signals","fixes":[{"rank":1,"action":"Specific change to make","rationale":"Why this helps","auto_applicable":true}],"overall_severity":"critical|warning|pass"}
+Max 3 fixes ranked by expected impact. Be specific — reference actual dates and values from the signals."""
+        user = f"""Hypothesis: {context.get('hypothesis','TopView')} | Advertiser: {context.get('advertiser','Unknown')}
+Pre-period: {context.get('pre_start')} → {context.get('pre_end')} ({context.get('pre_days')} days)
+Post-period: {context.get('post_start')} → {context.get('post_end')} ({context.get('post_days')} days)
+Target: {context.get('target')} | Covariates: {context.get('covariates')}
+MAPE: {context.get('mape','?')}% | p-value: {context.get('p_value','?')}
+
+Signals detected:
+{json.dumps(signals, indent=2)}
+
+Diagnose and provide ranked fixes."""
+        resp = client.chat.completions.create(
+            model=OPENAI_DEFAULT_MODEL, max_tokens=700,
+            messages=[{"role":"system","content":system}, {"role":"user","content":user}]
+        )
+        raw = resp.choices[0].message.content.strip()
+        return _safe_json_loads(raw)
+    except Exception as e:
+        return {"headline": "Diagnostic error", "diagnosis": str(e), "fixes": [], "overall_severity": "unknown"}
+
+
+def call_llm_narrator(ci_summary, context):
+    """After a clean model run, write the client-ready commercial interpretation."""
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY", "")
+        if not api_key: return None
+        client = OpenAI(base_url=ARK_BASE_URL, api_key=api_key)
+        system = """You are a senior TikTok measurement analyst writing a client-facing results narrative.
+Write in commercial, confident language. No jargon. Lead with the result, explain what it means for the business, note any caveats.
+Output ONLY valid JSON — no markdown, no preamble.
+Schema: {"headline":"Bold one-sentence result","what_happened":"2-3 sentences on what the model found","business_meaning":"2 sentences on what this means commercially","methodology_note":"1 sentence on model approach for credibility","caveat":"1 sentence on limitations if any (or null)"}"""
+        user = f"""Advertiser: {context.get('advertiser')} | Hypothesis: {context.get('hypothesis')}
+Test period: {context.get('post_start')} → {context.get('post_end')}
+Target metric: {context.get('target')}
+Result: {ci_summary.get('rel_effect_pct','?')}% relative lift | {ci_summary.get('cum_effect','?')} cumulative units | p={ci_summary.get('p_value','?')} | MAPE={ci_summary.get('mape','?')}%
+95% CI: [{ci_summary.get('rel_lower','?')}%, {ci_summary.get('rel_upper','?')}%]
+Write the client-ready narrative."""
+        resp = client.chat.completions.create(
+            model=OPENAI_DEFAULT_MODEL, max_tokens=500,
+            messages=[{"role":"system","content":system}, {"role":"user","content":user}]
+        )
+        raw = resp.choices[0].message.content.strip()
+        return _safe_json_loads(raw)
+    except Exception:
+        return None
+
+
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in dict(
     raw_df=None, daily_df=None, file_type=None,
@@ -874,6 +1251,10 @@ for k, v in dict(
     sot_targets=[], sot_treatment_start=None, sot_treatment_end=None,
     sot_channel_roles={}, cpa_inputs={}, sot_selected_targets=[], llm_eda_result=None,
     visual_studio_history=[], gt_data=None, gt_keywords=[], summary_report=None,
+    ci_result=None, ci_mape=None, ci_ape_df=None, ci_p_value=None,
+    ci_signals=None, ci_llm_diagnosis=None, ci_narrator=None,
+    ci_summary_data=None, ci_covariates=[], ci_run_count=0,
+    brief_text="", ai_synthesis=None,
 ).items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -886,8 +1267,14 @@ def badge(t): return f'<span class="sbadge">{t}</span>'
 def mtile(lbl, val, cls=""): return f'<div class="mtile"><div class="ml">{lbl}</div><div class="mv {cls}">{val}</div></div>'
 
 def parse_dates(df, col="p_date"):
+    import re as _re
     df = df.copy()
-    df[col] = pd.to_datetime(df[col], errors="coerce")
+    sample = df[col].dropna().astype(str).head(30)
+    day_first = any(
+        int(_re.split(r"[/\-]", s)[0]) > 12
+        for s in sample if _re.match(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{4}", s)
+    )
+    df[col] = pd.to_datetime(df[col], dayfirst=day_first, errors="coerce")
     return df.sort_values(col).reset_index(drop=True)
 
 SOT_HYPOTHESES = {"cross_channel", "marketplace_spillover", "sot_holdout"}
@@ -896,6 +1283,7 @@ SOT_HYPOTHESES = {"cross_channel", "marketplace_spillover", "sot_holdout"}
 CH_NAME_MAP = {
     # TikTok
     "tiktok":                  "Paid_Social_TikTok",
+    "tiktok ads":              "Paid_Social_TikTok",
     "paid social tiktok":      "Paid_Social_TikTok",
     "paid social - tiktok":    "Paid_Social_TikTok",
     "paid_social_tiktok":      "Paid_Social_TikTok",
@@ -903,6 +1291,7 @@ CH_NAME_MAP = {
     "tt":                      "Paid_Social_TikTok",
     # Meta
     "meta":                    "Paid_Social_Meta",
+    "meta ads":                "Paid_Social_Meta",
     "facebook":                "Paid_Social_Meta",
     "fb":                      "Paid_Social_Meta",
     "paid social meta":        "Paid_Social_Meta",
@@ -928,6 +1317,12 @@ CH_NAME_MAP = {
     "organic (google)":        "Organic_Search",
     "organic search (google)": "Organic_Search",
     "seo":                     "Organic_Search",
+    # Other / catch-all
+    "other":                   "Other",
+    "others":                  "Other",
+    # Grand Total — kept so it parses cleanly; users can exclude it in col selection
+    "grand total":             "Grand_Total",
+    "total":                   "Grand_Total",
 }
 
 METRIC_NAME_MAP = {
@@ -1005,7 +1400,9 @@ def _build_cols_from_two_header_rows(row0, row1):
         sv = str(v).strip() if v is not None and str(v).lower() not in ("nan","none","") else ""
         if sv:
             canon = _ch(sv)
-            if canon: last_ch = canon
+            # Always update last_ch when we see a non-empty header cell, even if
+            # unrecognised — prevents unknown channels from inheriting the previous one
+            last_ch = canon if canon else sv.replace(" ", "_").replace("-", "_")
         ch_filled.append(last_ch)
 
     cols = []
@@ -1151,7 +1548,10 @@ def _finalise(df, ftype):
         date_cands = [c for c in df.columns if "date" in str(c).lower()]
         if date_cands: df = df.rename(columns={date_cands[0]: "p_date"})
         else: df = df.rename(columns={df.columns[0]: "p_date"})
-    df["p_date"] = pd.to_datetime(df["p_date"], errors="coerce")
+    import re as _re
+    _samp = df["p_date"].dropna().astype(str).head(30)
+    _dfirst = any(int(_re.split(r"[/\-]", s)[0]) > 12 for s in _samp if _re.match(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{4}", s))
+    df["p_date"] = pd.to_datetime(df["p_date"], dayfirst=_dfirst, errors="coerce")
     df = df.dropna(subset=["p_date"]).sort_values("p_date").reset_index(drop=True)
     return df
 
@@ -1275,8 +1675,8 @@ def call_ark(api_key, endpoint_id, text):
 Brief: "{text}"
 JSON: {{"advertiser":"","hypothesis_type":"topview_conversion|spend_scaling|tts_gmv|full_funnel|third_party|unknown","target_kpi":"","campaign_format":"","intervention_notes":"","complexity_flags":[],"summary":""}}"""
         r = client.chat.completions.create(model=endpoint_id, messages=[{"role":"user","content":prompt}], temperature=0.1, max_tokens=400)
-        t = r.choices[0].message.content.strip().replace("json","").replace("","").strip()
-        return json.loads(t)
+        t = r.choices[0].message.content.strip()
+        return _safe_json_loads(t)
     except Exception as e:
         return {"error": str(e)}
 
@@ -1306,11 +1706,12 @@ with st.sidebar:
                 st.session_state.max_step = 0
                 st.rerun()
 
-    # Sidebar shows 3 logical groups mapping to internal steps 1-6
+    # Sidebar shows logical groups mapping to internal steps
     LOGICAL_STEPS = [
-        ("1 · Setup", [1, 2], 1),
-        ("2 · Data Treatment", [3], 3),
-        ("3 · EDA + Export", [4, 6], 4),
+        ("1 · Setup",         [1, 2],    1),
+        ("2 · Data Treatment",[3],       3),
+        ("3 · EDA",           [4, 5, 6], 4),
+        ("4 · Model",         [7, 8],    7),
     ]
     cur = st.session_state.step
     st.session_state.max_step = max(st.session_state.get("max_step", 0), cur)
@@ -1347,119 +1748,216 @@ with st.sidebar:
 <div style="font-size:11px;color:{C['grey']}">{df_['p_date'].min().strftime('%d %b')} – {df_['p_date'].max().strftime('%d %b %Y')} · {len(df_)} days</div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 0 — HYPOTHESIS SELECTION
+# AI SYNTHESIS HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_synthesis_stats(df, brief_text=""):
+    """Compute structured stats summary for LLM synthesis. Python does the maths, LLM writes the narrative."""
+    import re as _re
+    lines = []
+    df = df.copy()
+    df["p_date"] = pd.to_datetime(df["p_date"], errors="coerce")
+    df = df.dropna(subset=["p_date"]).sort_values("p_date")
+
+    date_min = df["p_date"].min().date()
+    date_max = df["p_date"].max().date()
+    total_days = (date_max - date_min).days + 1
+    lines.append(f"DATE RANGE: {date_min} to {date_max} ({total_days} calendar days, {len(df)} rows)")
+
+    # Attempt to detect intervention window from brief
+    interv_start = None
+    if brief_text:
+        date_hits = _re.findall(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}", brief_text)
+        parsed_hits = []
+        for dh in date_hits:
+            try:
+                parsed_hits.append(pd.to_datetime(dh, dayfirst=True))
+            except Exception:
+                pass
+        if len(parsed_hits) >= 2:
+            parsed_hits.sort()
+            interv_start = parsed_hits[0].date()
+            interv_end   = parsed_hits[-1].date()
+            lines.append(f"BRIEF DATES DETECTED: {interv_start} to {interv_end}")
+        elif len(parsed_hits) == 1:
+            interv_start = parsed_hits[0].date()
+            lines.append(f"BRIEF DATE DETECTED: {interv_start}")
+
+    # Detect numeric columns (exclude date)
+    num_cols = [c for c in df.columns if c != "p_date" and pd.api.types.is_numeric_dtype(df[c])]
+
+    # Split into pre/post using intervention start or 80/20
+    if interv_start and interv_start > date_min:
+        pre_df  = df[df["p_date"].dt.date < interv_start]
+        post_df = df[df["p_date"].dt.date >= interv_start]
+        lines.append(f"SPLIT: pre={len(pre_df)}d (before {interv_start}), post={len(post_df)}d (from {interv_start})")
+        ratio = len(pre_df) / len(post_df) if len(post_df) > 0 else 0
+        ratio_q = "✅ Good" if ratio >= 2 else "⚠️ Borderline" if ratio >= 1 else "❌ Too short"
+        lines.append(f"PRE/POST RATIO: {ratio:.1f}x — {ratio_q}")
+    else:
+        n = len(df)
+        split_idx = int(n * 0.8)
+        pre_df  = df.iloc[:split_idx]
+        post_df = df.iloc[split_idx:]
+        lines.append(f"SPLIT (80/20 auto): pre={len(pre_df)}d, post={len(post_df)}d")
+
+    # Per-channel DoD summary
+    lines.append("\nCHANNEL PERFORMANCE (pre avg → post avg, % change):")
+    channel_stats = []
+    for col in num_cols[:15]:
+        pre_avg  = pre_df[col].mean()  if len(pre_df)  else 0
+        post_avg = post_df[col].mean() if len(post_df) else 0
+        if pre_avg == 0 and post_avg == 0: continue
+        lift = (post_avg - pre_avg) / pre_avg * 100 if pre_avg != 0 else 0
+        sign = "+" if lift >= 0 else ""
+        cv   = pre_df[col].std() / pre_avg * 100 if pre_avg != 0 else 0
+        channel_stats.append((col, pre_avg, post_avg, lift, cv))
+        lines.append(f"  {col}: {pre_avg:,.1f} → {post_avg:,.1f} ({sign}{lift:.1f}%) | Pre-CV: {cv:.0f}%")
+
+    # Outlier detection: top 3 spike/dip days per key column
+    lines.append("\nOUTLIER FLAGS (days > 2.5 SD from rolling mean):")
+    for col, *_ in channel_stats[:5]:
+        roll = df[col].rolling(7, min_periods=1, center=True).mean()
+        roll_std = df[col].rolling(7, min_periods=1, center=True).std().fillna(1)
+        z = (df[col] - roll) / roll_std.replace(0, 1)
+        spikes = df.loc[z.abs() > 2.5, "p_date"].dt.date.tolist()
+        if spikes:
+            lines.append(f"  {col}: {spikes[:4]}")
+
+    # Correlation matrix (pre-period only, top pairs)
+    lines.append("\nPRE-PERIOD CORRELATIONS (R²) — top covariate candidates:")
+    if len(num_cols) > 1 and len(pre_df) > 5:
+        corr = pre_df[num_cols].corr()
+        pairs = []
+        for i, c1 in enumerate(num_cols):
+            for c2 in num_cols[i+1:]:
+                r = corr.loc[c1, c2]
+                if not np.isnan(r):
+                    pairs.append((abs(r), c1, c2, r))
+        pairs.sort(reverse=True)
+        for r_abs, c1, c2, r in pairs[:8]:
+            lines.append(f"  {c1} × {c2}: R={r:.2f} (R²={r_abs**2:.2f})")
+
+    return "\n".join(lines)
+
+
+def call_synthesis_llm(api_key, endpoint, stats_text, brief_text):
+    """
+    LLM synthesis: Python computed the numbers, LLM writes the analyst narrative.
+    Returns structured dict with narrative sections.
+    """
+    if not api_key or not endpoint:
+        return None, "No API key configured."
+
+    prompt = f"""You are a senior TikTok Measurement Partner analyst. You have received a sales brief and raw data statistics. Your job is to synthesise these into a structured pre-modelling analysis — exactly as an experienced analyst would do before touching a model.
+
+SALES BRIEF:
+{brief_text or "No brief provided — infer from data patterns."}
+
+DATA STATISTICS (computed by Python — these numbers are accurate):
+{stats_text}
+
+Return ONLY a JSON object (no markdown, no backticks) with this exact structure:
+
+{{
+  "what_data_shows": "2-3 sentences on what the data actually shows. Name channels and cite specific numbers from the stats.",
+  "raw_did": "Plain-English difference-in-differences summary. For each key channel: pre avg → post avg, % change, and one-word characterisation (flat/up/spike/volatile). Bullet format with \\n between items.",
+  "intervention_assessment": "Assessment of the proposed intervention window based on the brief and data. Is the pre-period long enough? Is the ratio acceptable? Any contamination risks?",
+  "spikes_and_anomalies": "Identify the specific outlier dates flagged and what likely caused them (seasonal, promotional, external). Recommend whether to flag or exclude.",
+  "recommended_periods": {{
+    "pre_start": "YYYY-MM-DD",
+    "pre_end": "YYYY-MM-DD",
+    "post_start": "YYYY-MM-DD",
+    "post_end": "YYYY-MM-DD",
+    "rationale": "One sentence explaining the recommended windows."
+  }},
+  "covariate_recommendations": [
+    {{"column": "column_name", "role": "Covariate", "rationale": "Why this variable works as a covariate — cite R² from the stats.", "risk": "None|Low|Medium|High"}},
+    {{"column": "column_name", "role": "Exclude", "rationale": "Why to exclude — endogeneity, instability, etc.", "risk": "Medium"}}
+  ],
+  "hypothesis_suggestion": "One sentence: what hypothesis does this data best support? E.g. 'This data is best framed as a Smart+ Catalog impact on TikTok-attributed conversions.'",
+  "watchouts": ["Specific risk 1 — be concrete, cite dates or channels", "Specific risk 2", "Specific risk 3"],
+  "readiness": "Ready|Caution|Not ready",
+  "readiness_reason": "One sentence."
+}}"""
+
+    try:
+        client = OpenAI(base_url=ARK_BASE_URL, api_key=api_key)
+        r = client.chat.completions.create(
+            model=endpoint,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.25,
+            max_tokens=2500,
+        )
+        raw = r.choices[0].message.content.strip()
+        return _safe_json_loads(raw), None
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error: {e} — raw: {raw[:500]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 0 — BRIEF + UPLOAD (entry point)
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.step == 0:
-    st.markdown(f'''<div style="text-align:center;padding:40px 0 32px">
-      <div style="font-size:32px;margin-bottom:12px">🎯</div>
-      <div style="font-size:28px;font-weight:700;color:{C['text']};margin-bottom:8px">What are you trying to prove?</div>
-      <div style="font-size:15px;color:{C['grey']};max-width:520px;margin:0 auto">Select the use case that matches your client brief. This shapes how the data is cleaned, aggregated, and interpreted.</div>
+    st.markdown(f'''<div style="text-align:center;padding:32px 0 24px">
+      <div style="font-size:30px;margin-bottom:10px">🎯</div>
+      <div style="font-size:26px;font-weight:700;color:{C['text']};margin-bottom:6px">TikTok Causal Hub</div>
+      <div style="font-size:14px;color:{C['grey']};max-width:480px;margin:0 auto">Drop in the brief and your data. The AI will analyse everything and tell you what it sees before you touch a model.</div>
     </div>''', unsafe_allow_html=True)
 
-    # 2-column card grid
-    col_a, col_b = st.columns(2, gap="large")
-    for idx, uc in enumerate(USE_CASES):
-        col = col_a if idx % 2 == 0 else col_b
-        with col:
-            selected = st.session_state.hypothesis == uc["id"]
-            border_style = f"2px solid {uc['colour']}" if selected else f"1px solid {C['border']}"
-            bg_style = f"{uc['colour']}08" if selected else C["surface"]
-            check = "✓ " if selected else ""
-            st.markdown(f'''<div style="background:{bg_style};border:{border_style};border-radius:14px;padding:22px 24px;margin-bottom:14px;cursor:pointer;transition:all .15s;">
-  <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;">
-    <div style="display:flex;align-items:center;gap:10px;">
-      <span style="font-size:22px">{uc['icon']}</span>
-      <div style="font-size:14px;font-weight:700;color:{C['text']}">{check}{uc['name']}</div>
-    </div>
-    <span class="pill {uc['tag_cls']}" style="white-space:nowrap">{uc['tag']}</span>
-  </div>
-  <div style="font-size:12px;color:{C['grey']};margin-bottom:10px;line-height:1.6"><strong style="color:{C['text']}">Challenge:</strong> {uc['challenge']}</div>
-  <div style="font-size:12px;color:{C['grey']};margin-bottom:10px;line-height:1.6"><strong style="color:{C['text']}">The pitch:</strong> {uc['pitch']}</div>
-  <div style="font-size:11px;background:{C['bg']};border:1px solid {C['border']};border-radius:6px;padding:6px 10px;color:{C['grey']}">📁 {uc['data_source']}</div>
-</div>''', unsafe_allow_html=True)
-            if st.button(f"{'✓ Selected' if selected else 'Select'} — {uc['name']}", key=f"uc_{uc['id']}", use_container_width=True):
-                st.session_state.hypothesis = uc["id"]
-                st.rerun()
+    col_left, col_right = st.columns([3, 2], gap="large")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    # Only show continue if a hypothesis is selected
-    if st.session_state.hypothesis:
-        uc_sel = next(u for u in USE_CASES if u["id"] == st.session_state.hypothesis)
-        st.markdown(f'''<div style="background:{uc_sel['colour']}10;border:1px solid {uc_sel['colour']}44;border-radius:10px;padding:14px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px;">
-  <span style="font-size:24px">{uc_sel['icon']}</span>
-  <div>
-    <div style="font-weight:600;color:{C['text']}">{uc_sel['name']}</div>
-    <div style="font-size:12px;color:{C['grey']}">Ready to continue with this hypothesis</div>
-  </div>
-</div>''', unsafe_allow_html=True)
-        _, btn_col, _ = st.columns([1,2,1])
-        with btn_col:
-            if st.button("Continue →  Upload Data", use_container_width=True, key="hyp_continue"):
-                st.session_state.step = 1
-                st.session_state.max_step = 1
-                st.rerun()
-    else:
-        st.markdown(f'<div style="text-align:center;font-size:13px;color:{C['grey']}">Select a use case above to continue.</div>', unsafe_allow_html=True)
+    with col_left:
+        st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.07em;margin-bottom:6px">PASTE THE BRIEF</div>', unsafe_allow_html=True)
+        brief_in = st.text_area(
+            "brief",
+            value=st.session_state.brief_text,
+            height=220,
+            placeholder=(
+                'Paste the brief from the sales team here — e.g.\n\n'
+                '"Babyboo ran Smart+ Catalog from 1 Mar – 5 May 2026 ($470k). '
+                'They want to prove holistic value of Smart+ Catalog and disprove '
+                'negative impact on Non-Catalog conversions. KPI: conversions (ROAS & CPA). '
+                'Submitted by Nikki Strover-Wood, KA3 Fashion team."'
+            ),
+            label_visibility="collapsed",
+        )
+        st.session_state.brief_text = brief_in
 
-elif st.session_state.step == 1:
-    st.markdown(f'{badge("Step 1")} <span style="font-size:20px;font-weight:600;margin-left:10px">Context & Upload</span>', unsafe_allow_html=True)
-    st.markdown(f'<div style="color:{C["grey"]};margin-bottom:24px">Describe the brief you received, then upload your TTAM data export.</div>', unsafe_allow_html=True)
+        if brief_in:
+            st.markdown(f'<div style="font-size:11px;color:{C["grey"]};margin-top:4px">✓ Brief received — upload your data file to continue.</div>', unsafe_allow_html=True)
 
-    c1, c2 = st.columns([3,2], gap="large")
-
-    with c1:
-        st.markdown('<div style="font-size:12px;font-weight:600;color:#aaa;margin-bottom:6px;letter-spacing:.05em">CAUSAL CONTEXT BRIEF</div>', unsafe_allow_html=True)
-        ctx = st.text_area("ctx", value=st.session_state.causal_context, height=170,
-            placeholder='e.g. "The CSM says Chemist Warehouse ran a TopView on Sept 18 for Footy Finals. They want to know if it drove incremental TikTok-attributed conversions above their existing mid-funnel baseline. There was also a brand campaign that launched in August which may complicate the pre-period."',
-            label_visibility="collapsed")
-        st.session_state.causal_context = ctx
-
-        if ctx and st.session_state.ark_key and st.session_state.ark_endpoint:
-            if st.button("🤖 Parse brief with AI"):
-                with st.spinner("Parsing…"):
-                    res = call_ark(st.session_state.ark_key, st.session_state.ark_endpoint, ctx)
-                    st.session_state.parsed_context = res
-                    if res.get("advertiser") and not st.session_state.advertiser:
-                        st.session_state.advertiser = res["advertiser"]
-        elif ctx and not (st.session_state.ark_key and st.session_state.ark_endpoint):
-            st.markdown(f'<div style="font-size:11px;color:{C["grey"]};margin-top:6px">Add your Ark API key and endpoint ID to auto-parse this brief.</div>', unsafe_allow_html=True)
-
-        pc = st.session_state.parsed_context
-        if pc and pc.get("summary"):
-            st.markdown(f"""<div style="background:#00F2EA09;border:1px solid {C['purple']}33;border-radius:10px;padding:14px;margin-top:10px">
-<div style="font-size:10px;color:{C['purple']};font-weight:600;letter-spacing:.08em;margin-bottom:8px">AI INTERPRETATION</div>
-<div style="font-size:13px;margin-bottom:10px">{pc['summary']}</div>
-<div>{pill(pc.get('target_kpi',''),'pill-c') if pc.get('target_kpi') else ''} {pill(pc.get('campaign_format',''),'pill-c') if pc.get('campaign_format') else ''} {' '.join(pill(f,'pill-a') for f in pc.get('complexity_flags',[]))}</div>
-</div>""", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div style="font-size:12px;font-weight:600;color:#aaa;margin-bottom:6px;letter-spacing:.05em">UPLOAD DATA</div>', unsafe_allow_html=True)
-        uploaded = st.file_uploader("upload", type=["csv","xlsx"], label_visibility="collapsed",
-            help="Raw TTAM export (multi-row/day with L4 tags) or pre-aggregated daily CSV")
-        st.markdown(f"""<div style="font-size:12px;color:{C['grey']};line-height:1.9;margin-top:10px">
+    with col_right:
+        st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.07em;margin-bottom:6px">UPLOAD DATA</div>', unsafe_allow_html=True)
+        uploaded = st.file_uploader(
+            "upload", type=["csv", "xlsx"], label_visibility="collapsed",
+            help="GA4/SOT daily export, raw TTAM export, or pre-aggregated daily CSV"
+        )
+        st.markdown(f"""<div style="font-size:12px;color:{C['grey']};line-height:1.9;margin-top:8px">
+<span style="color:{C['purple']};font-weight:600">GA4 / SOT export</span> — multi-channel daily data (sessions, conversions, revenue).<br>
 <span style="color:{C['purple']};font-weight:600">Raw TTAM export</span> — one row per L4 product tag per day.<br>
-<span style="color:{C['purple']};font-weight:600">Pre-aggregated</span> — already has BrandCostExTV, MidFunnelCost etc. as columns.</div>""", unsafe_allow_html=True)
+<span style="color:{C['purple']};font-weight:600">Pre-aggregated</span> — already has BrandCostExTV, MidFunnelCost etc.</div>""", unsafe_allow_html=True)
 
         if uploaded:
             try:
-                # ── Single unified parser ──────────────────────────────────
                 uploaded.seek(0)
                 raw, ftype, parse_warnings = normalise_file(uploaded, uploaded.name)
-
                 if raw is None or len(raw) == 0:
                     st.error(f"Could not read file: {'; '.join(parse_warnings)}")
                 else:
                     for w in parse_warnings:
                         st.warning(w)
 
-                    # Reset stale state on new file
                     file_sig = f"{uploaded.name}_{uploaded.size}"
                     if st.session_state.get("_last_file_sig") != file_sig:
                         st.session_state._last_file_sig = file_sig
-                        for k in ["sot_treatment_start","sot_treatment_end","pre_start","pre_end",
-                                  "post_start","post_end","summary_report","visual_studio_history",
-                                  "gt_data","daily_df","sot_selected_targets","sot_channel_roles"]:
-                            st.session_state[k] = [] if "history" in k else (None if k != "gt_data" else None)
+                        for k in ["sot_treatment_start", "sot_treatment_end", "pre_start", "pre_end",
+                                  "post_start", "post_end", "summary_report", "visual_studio_history",
+                                  "gt_data", "daily_df", "sot_selected_targets", "sot_channel_roles",
+                                  "ai_synthesis", "hypothesis"]:
+                            st.session_state[k] = [] if "history" in k else None
 
                     st.session_state.raw_df = raw
                     st.session_state.file_type = ftype
@@ -1468,46 +1966,239 @@ elif st.session_state.step == 1:
                     if ftype == "pre_aggregated":
                         st.session_state.daily_df = raw
 
-                    date_range_str = (f"{raw['p_date'].min().strftime('%d %b %Y')} – "
-                                      f"{raw['p_date'].max().strftime('%d %b %Y')}"
-                                      if raw["p_date"].notna().any() else "—")
+                    date_range_str = (
+                        f"{raw['p_date'].min().strftime('%d %b %Y')} – {raw['p_date'].max().strftime('%d %b %Y')}"
+                        if raw["p_date"].notna().any() else "—"
+                    )
                     ch_detected = parse_sot_columns(raw) if ftype == "sot" else {}
-                    ch_names = [k.replace("Paid_Social_","").replace("Paid_Search_","").replace("_"," ")
+                    ch_names = [k.replace("Paid_Social_", "").replace("Paid_Search_", "").replace("_", " ")
                                 for k in ch_detected if k != "Other"]
                     ch_str = " · ".join(ch_names) if ch_names else ""
+                    ftype_label = {"raw_ttam": "Raw TTAM", "sot": "SOT / GA4", "pre_aggregated": "Pre-aggregated"}.get(ftype, ftype)
+
                     st.markdown(f"""<div style="background:{C['purple']}08;border:1px solid {C['purple']}33;border-radius:8px;padding:14px;margin-top:10px">
 <div style="font-weight:600;color:{C['purple']};margin-bottom:4px">✓ {uploaded.name}</div>
 <div style="font-size:12px;color:{C['grey']}">{len(raw):,} rows · {date_range_str}</div>
 {f'<div style="font-size:11px;color:{C["grey"]};margin-top:4px">Channels: {ch_str}</div>' if ch_str else ""}
-<div style="margin-top:6px">
-{pill("Raw TTAM — step 2 will aggregate","pill-a") if ftype=="raw_ttam" else pill("SOT / GA4 multi-channel","pill-c") if ftype=="sot" else pill("Pre-aggregated","pill-g")}
-</div></div>""", unsafe_allow_html=True)
+<div style="margin-top:6px">{pill(ftype_label, "pill-c")}</div>
+</div>""", unsafe_allow_html=True)
+
             except Exception as e:
                 st.error(f"Could not read file: {e}")
 
+    # Advertiser name + Analyse button
     if st.session_state.raw_df is not None:
         st.markdown("<br>", unsafe_allow_html=True)
-        ca, cb = st.columns([3,1])
-        with ca:
-            adv = st.text_input("Advertiser name", value=st.session_state.advertiser, placeholder="e.g. Chemist Warehouse")
+        adv_c, btn_c = st.columns([3, 1])
+        with adv_c:
+            adv = st.text_input("Advertiser name", value=st.session_state.advertiser or "", placeholder="e.g. Babyboo")
             st.session_state.advertiser = adv
-        with cb:
+        with btn_c:
             st.markdown("<br>", unsafe_allow_html=True)
-            _lbl = "Auto-aggregate & Continue →" if st.session_state.file_type == "raw_ttam" else "Continue →"
-            if st.button(_lbl, use_container_width=True):
+            if st.button("🤖 Analyse →", use_container_width=True, type="primary"):
+                # Aggregate TTAM if needed
                 if st.session_state.file_type == "raw_ttam":
                     try:
-                        _raw = st.session_state.raw_df
-                        agg = aggregate_ttam(_raw, L4_MAP, CONV_EVENTS)
+                        agg = aggregate_ttam(st.session_state.raw_df, L4_MAP, CONV_EVENTS)
                         st.session_state.daily_df = agg
-                        st.session_state.step = 3
                     except Exception:
-                        st.session_state.step = 2  # fall back to manual mapping
+                        pass
                 elif st.session_state.file_type == "sot":
-                    st.session_state.step = 2
+                    st.session_state.daily_df = st.session_state.raw_df.copy()
                 else:
-                    st.session_state.step = 3
+                    st.session_state.daily_df = st.session_state.raw_df.copy()
+                st.session_state.step = 1
+                st.session_state.max_step = max(st.session_state.max_step, 1)
                 st.rerun()
+
+elif st.session_state.step == 1:
+    # ── AI Synthesis screen ───────────────────────────────────────────────────
+    st.markdown(f'{badge("Step 1")} <span style="font-size:20px;font-weight:600;margin-left:10px">AI Analysis</span>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["grey"]};margin-bottom:20px">The AI reads your brief and data together — just like a senior analyst would before touching the model.</div>', unsafe_allow_html=True)
+
+    df_synth = st.session_state.daily_df
+    if df_synth is None and st.session_state.raw_df is not None:
+        df_synth = st.session_state.raw_df.copy()
+
+    if df_synth is None:
+        st.warning("No data loaded. Go back and upload a file.")
+        if st.button("← Back"): st.session_state.step = 0; st.rerun()
+        st.stop()
+
+    df_synth = parse_dates(df_synth)
+
+    # Run synthesis if not yet done
+    if st.session_state.ai_synthesis is None:
+        with st.spinner("Analysing data and brief…"):
+            stats_text = build_synthesis_stats(df_synth, st.session_state.brief_text)
+            result, err = call_synthesis_llm(
+                st.session_state.ark_key,
+                st.session_state.ark_endpoint,
+                stats_text,
+                st.session_state.brief_text,
+            )
+        if err or result is None:
+            st.error(f"Synthesis error: {err}")
+            st.code(stats_text, language="text")
+            if st.button("← Back"): st.session_state.step = 0; st.rerun()
+            st.stop()
+        st.session_state.ai_synthesis = result
+        st.rerun()
+
+    syn = st.session_state.ai_synthesis
+
+    # ── Quick data summary bar ──────────────────────────────────────────────
+    df_synth = parse_dates(df_synth)
+    date_min_s = df_synth["p_date"].min().date()
+    date_max_s = df_synth["p_date"].max().date()
+    total_rows_s = len(df_synth)
+    num_cols_s = len([c for c in df_synth.columns if c != "p_date" and pd.api.types.is_numeric_dtype(df_synth[c])])
+    st.markdown(f'''<div class="mrow">
+{mtile("Data range", f"{date_min_s.strftime('%d %b')} – {date_max_s.strftime('%d %b %Y')}")}
+{mtile("Rows", f"{total_rows_s:,}")}
+{mtile("Channels / metrics", str(num_cols_s))}
+{mtile("Advertiser", st.session_state.advertiser or "—")}
+</div>''', unsafe_allow_html=True)
+
+    # ── Left / Right layout ─────────────────────────────────────────────────
+    col_syn_l, col_syn_r = st.columns([3, 2], gap="large")
+
+    with col_syn_l:
+        # What the data shows
+        st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin-bottom:6px">📊 What the data shows</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card">{syn.get("what_data_shows","—")}</div>', unsafe_allow_html=True)
+
+        # Raw DoD
+        st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin:14px 0 6px">📈 Raw difference-in-differences</div>', unsafe_allow_html=True)
+        did_lines = syn.get("raw_did", "—").split("\n")
+        did_html = "".join(
+            f'<div style="font-size:12px;color:{C["text"]};padding:5px 0;border-bottom:1px solid {C["border"]}">{ln}</div>'
+            for ln in did_lines if ln.strip()
+        )
+        st.markdown(f'<div class="card">{did_html}</div>', unsafe_allow_html=True)
+
+        # Intervention assessment
+        st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin:14px 0 6px">📅 Intervention window assessment</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card">{syn.get("intervention_assessment","—")}</div>', unsafe_allow_html=True)
+
+        # Spikes and anomalies
+        if syn.get("spikes_and_anomalies"):
+            st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin:14px 0 6px">⚡ Spikes & anomalies</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="card card-a">{syn.get("spikes_and_anomalies","")}</div>', unsafe_allow_html=True)
+
+    with col_syn_r:
+        # Recommended periods
+        rp = syn.get("recommended_periods", {})
+        st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin-bottom:6px">⚙️ Recommended model windows</div>', unsafe_allow_html=True)
+        if rp:
+            try:
+                pre_days_r  = (pd.Timestamp(rp.get("pre_end"))  - pd.Timestamp(rp.get("pre_start"))).days  + 1
+                post_days_r = (pd.Timestamp(rp.get("post_end")) - pd.Timestamp(rp.get("post_start"))).days + 1
+                ratio_r     = pre_days_r / post_days_r if post_days_r else 0
+                rc_r = "mvc" if ratio_r >= 2 else "mva" if ratio_r >= 1 else "mvr"
+            except Exception:
+                pre_days_r = post_days_r = 0; ratio_r = 0; rc_r = "mvr"
+            st.markdown(f'''<div class="mrow">
+{mtile("Pre", f"{pre_days_r}d")}
+{mtile("Post", f"{post_days_r}d")}
+{mtile("Ratio", f"{ratio_r:.1f}x", rc_r)}
+</div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div class="card" style="font-size:12px">
+<div style="margin-bottom:6px"><span style="font-weight:600;color:{C["grey"]}">Pre:</span> {rp.get("pre_start","?")} → {rp.get("pre_end","?")}</div>
+<div style="margin-bottom:8px"><span style="font-weight:600;color:{C["grey"]}">Post:</span> {rp.get("post_start","?")} → {rp.get("post_end","?")}</div>
+<div style="font-size:11px;color:{C["grey"]};font-style:italic">{rp.get("rationale","")}</div>
+</div>''', unsafe_allow_html=True)
+
+        # Covariate recommendations
+        covs = syn.get("covariate_recommendations", [])
+        if covs:
+            st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin:14px 0 6px">🔗 Covariate recommendations</div>', unsafe_allow_html=True)
+            for cov in covs:
+                role = cov.get("role", "")
+                risk = cov.get("risk", "")
+                pill_cls = "pill-c" if role == "Covariate" else "pill-r"
+                risk_cls = "pill-g" if risk == "None" or risk == "Low" else "pill-a" if risk == "Medium" else "pill-r"
+                st.markdown(f'''<div style="border:1px solid {C["border"]};border-radius:8px;padding:10px 12px;margin-bottom:6px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+  <span style="font-size:12px;font-weight:600;color:{C["text"]}">{cov.get("column","")}</span>
+  <span>{pill(role, pill_cls)} {pill(f"Risk: {risk}", risk_cls)}</span>
+</div>
+<div style="font-size:11px;color:{C["grey"]}">{cov.get("rationale","")}</div>
+</div>''', unsafe_allow_html=True)
+
+        # Watch-outs
+        watchouts = syn.get("watchouts", [])
+        if watchouts:
+            st.markdown(f'<div style="font-size:12px;font-weight:700;color:{C["text"]};margin:14px 0 6px">⚠️ Watch-outs</div>', unsafe_allow_html=True)
+            for wo in watchouts:
+                st.markdown(f'<div style="border-left:3px solid {C["amber"]};padding:6px 10px;margin-bottom:5px;font-size:12px;color:{C["text"]};background:{C["amber"]}08;border-radius:0 6px 6px 0">{wo}</div>', unsafe_allow_html=True)
+
+        # Readiness badge
+        readiness = syn.get("readiness", "Caution")
+        readiness_c = C["green"] if readiness == "Ready" else C["amber"] if readiness == "Caution" else C["red"]
+        readiness_icon = "✅" if readiness == "Ready" else "⚠️" if readiness == "Caution" else "❌"
+        st.markdown(f'''<div style="margin-top:16px;background:{readiness_c}11;border:1px solid {readiness_c}44;border-radius:10px;padding:14px 16px">
+<div style="font-size:13px;font-weight:700;color:{readiness_c};margin-bottom:4px">{readiness_icon} {readiness}</div>
+<div style="font-size:12px;color:{C["text"]}">{syn.get("readiness_reason","")}</div>
+</div>''', unsafe_allow_html=True)
+
+        # Hypothesis suggestion
+        if syn.get("hypothesis_suggestion"):
+            st.markdown(f'''<div style="margin-top:12px;background:{C["surface2"]};border:1px solid {C["border"]};border-radius:8px;padding:12px 14px">
+<div style="font-size:10px;color:{C["grey"]};font-weight:600;letter-spacing:.07em;margin-bottom:4px">SUGGESTED HYPOTHESIS</div>
+<div style="font-size:12px;color:{C["text"]}">{syn.get("hypothesis_suggestion","")}</div>
+</div>''', unsafe_allow_html=True)
+
+    # ── Accept periods from synthesis into session state ─────────────────────
+    if rp and rp.get("pre_start") and st.session_state.pre_start is None:
+        try:
+            st.session_state.pre_start  = pd.Timestamp(rp["pre_start"]).date()
+            st.session_state.pre_end    = pd.Timestamp(rp["pre_end"]).date()
+            st.session_state.post_start = pd.Timestamp(rp["post_start"]).date()
+            st.session_state.post_end   = pd.Timestamp(rp["post_end"]).date()
+        except Exception:
+            pass
+
+    # ── Hypothesis confirmation (compact) ───────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.07em;margin-bottom:8px">CONFIRM HYPOTHESIS — override if needed</div>', unsafe_allow_html=True)
+    hyp_options = [u["id"] for u in USE_CASES]
+    hyp_labels  = {u["id"]: f"{u['icon']} {u['name']}" for u in USE_CASES}
+    current_hyp = st.session_state.hypothesis or hyp_options[0]
+    selected_hyp = st.selectbox(
+        "hyp_confirm",
+        options=hyp_options,
+        format_func=lambda x: hyp_labels.get(x, x),
+        index=hyp_options.index(current_hyp) if current_hyp in hyp_options else 0,
+        label_visibility="collapsed",
+    )
+    st.session_state.hypothesis = selected_hyp
+
+    # ── Nav ─────────────────────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    nav1, nav2, nav3 = st.columns([1, 2, 2])
+    with nav1:
+        if st.button("← Back"): st.session_state.step = 0; st.rerun()
+    with nav2:
+        if st.button("↺ Re-analyse", use_container_width=True):
+            st.session_state.ai_synthesis = None; st.rerun()
+    with nav3:
+        next_step = 2 if st.session_state.file_type == "sot" else (3 if st.session_state.file_type in ("sot", "pre_aggregated") else 2)
+        if st.button("Continue to EDA →", use_container_width=True, type="primary"):
+            if st.session_state.file_type == "raw_ttam" and st.session_state.daily_df is None:
+                try:
+                    agg = aggregate_ttam(st.session_state.raw_df, L4_MAP, CONV_EVENTS)
+                    st.session_state.daily_df = agg
+                    st.session_state.step = 3
+                except Exception:
+                    st.session_state.step = 2
+            elif st.session_state.file_type == "sot":
+                st.session_state.step = 2
+            else:
+                st.session_state.step = 3
+            st.session_state.max_step = max(st.session_state.max_step, st.session_state.step)
+            st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — MAP & AGGREGATE
@@ -1524,7 +2215,10 @@ elif st.session_state.step == 2:
         if "p_date" not in df.columns:
             dc = next((c for c in df.columns if "date" in c.lower()), df.columns[0])
             df = df.rename(columns={dc: "p_date"})
-        df["p_date"] = pd.to_datetime(df["p_date"], errors="coerce")
+        import re as _re2
+        _samp2 = df["p_date"].dropna().astype(str).head(30)
+        _dfirst2 = any(int(_re2.split(r"[/\-]", s)[0]) > 12 for s in _samp2 if _re2.match(r"\d{1,2}[/\-]\d{1,2}[/\-]\d{4}", s))
+        df["p_date"] = pd.to_datetime(df["p_date"], dayfirst=_dfirst2, errors="coerce")
         df = df.dropna(subset=["p_date"]).sort_values("p_date").reset_index(drop=True)
         # Safely convert any remaining object columns to numeric
         for c in df.columns:
@@ -2177,21 +2871,23 @@ elif st.session_state.step == 4:
         st.markdown(f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin-bottom:4px">🔍 Google Search Trends Overlay</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:12px">Overlay category and brand search volume to contextualise whether organic/direct channel lifts were driven by TikTok or external demand. Relative index (0–100) — useful for narrative, not model input.</div>', unsafe_allow_html=True)
 
-        gt_c1, gt_c2, gt_c3 = st.columns([3, 3, 1])
+        gt_c1, gt_c2, gt_c3, gt_c4 = st.columns([3, 3, 2, 1])
         with gt_c1:
             gt_brand = st.text_input("Brand keyword", placeholder="e.g. Chemist Warehouse", key="gt_brand")
         with gt_c2:
             gt_category = st.text_input("Category keyword", placeholder="e.g. pharmacy online", key="gt_cat")
         with gt_c3:
+            gt_geo = st.selectbox("Market", list(GEO_OPTIONS.keys()), index=0, key="gt_geo")
+        with gt_c4:
             st.markdown("<br>", unsafe_allow_html=True)
             gt_run = st.button("Fetch Trends", use_container_width=True, key="gt_run")
 
         if gt_run and (gt_brand or gt_category):
             keywords_to_fetch = [k for k in [gt_brand, gt_category] if k.strip()]
-            with st.spinner("Fetching Google Trends data (AU)..."):
+            with st.spinner(f"Fetching Google Trends data ({gt_geo})..."):
                 t_range_start = df["p_date"].min().date()
                 t_range_end   = df["p_date"].max().date()
-                df_trends, gt_err = fetch_google_trends(keywords_to_fetch, t_range_start, t_range_end)
+                df_trends, gt_err = fetch_google_trends(keywords_to_fetch, t_range_start, t_range_end, gt_geo)
             if gt_err:
                 st.markdown(f'<div class="card card-a">Google Trends error: {gt_err}</div>', unsafe_allow_html=True)
             elif df_trends is not None:
@@ -2229,10 +2925,10 @@ elif st.session_state.step == 4:
                         yaxis="y2", opacity=0.8
                     ))
             add_treatment(fig_gt)
-            _gt_layout = {k: v for k, v in CHART.items() if k not in ("yaxis","yaxis2")}
+            _gt_layout = {k: v for k, v in CHART.items() if k not in ("yaxis","yaxis2","legend")}
             fig_gt.update_layout(
                 **_gt_layout,
-                title=dict(text="Channel Metric vs Google Search Interest (AU)", font=dict(size=14)),
+                title=dict(text=f"Channel Metric vs Google Search Interest ({gt_geo})", font=dict(size=14)),
                 yaxis=dict(title="Channel metric", gridcolor="#E5E7EB", showgrid=True),
                 yaxis2=dict(title="Search interest (0–100)", overlaying="y", side="right",
                             showgrid=False, range=[0, 110],
@@ -2273,137 +2969,7 @@ elif st.session_state.step == 4:
                     elif low_corr:
                         st.markdown(f'<div class="card card-c">✓ <strong>Low correlation with search trends</strong> — the channel lift is unlikely to be explained by broader category demand. Stronger evidence for TikTok incrementality.</div>', unsafe_allow_html=True)
 
-        # ── PRE-MODELLING SUMMARY REPORT ───────────────────────────────────────────
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(f'<div style="height:1px;background:{C["border"]};margin:0 0 20px"></div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:14px;font-weight:700;color:{C["text"]};margin-bottom:4px">📋 Pre-Modelling Summary</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:12px">AI reads all EDA signals and generates a structured brief — channel performance, stability assessment, covariate recommendations, and readiness rating.</div>', unsafe_allow_html=True)
-
-        sum_col1, sum_col2 = st.columns([1, 5])
-        with sum_col1:
-            gen_summary = st.button("Generate Summary", key="gen_summary_btn", use_container_width=True)
-        with sum_col2:
-            if st.session_state.get("summary_report"):
-                if st.button("Clear", key="clear_summary_btn"):
-                    st.session_state.summary_report = None
-                    st.rerun()
-
-        if gen_summary:
-            with st.spinner("Generating pre-modelling brief..."):
-                summary_ctx = build_eda_summary(df, pre_df, post_df,
-                    st.session_state.hypothesis, "sot",
-                    st.session_state.sot_channel_roles,
-                    st.session_state.target_col,
-                    conv_cols_sot, sess_cols_sot)
-                report, err = call_ark_summary(
-                    st.session_state.ark_key,
-                    st.session_state.ark_endpoint,
-                    summary_ctx
-                )
-                if report:
-                    st.session_state.summary_report = report
-                else:
-                    st.error(f"Summary error: {err}")
-
-        if st.session_state.get("summary_report"):
-            st.markdown(f'''<div style="background:{C["surface"]};border:1px solid {C["border"]};border-left:3px solid {C["purple"]};border-radius:12px;padding:20px 24px;margin-bottom:16px">''', unsafe_allow_html=True)
-            st.markdown(st.session_state.summary_report)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # ── VISUAL STUDIO ──────────────────────────────────────────────────────────
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(f'<div style="height:1px;background:{C["border"]};margin:0 0 20px"></div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:14px;font-weight:700;color:{C["text"]};margin-bottom:4px">💬 Visual Studio</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:14px">Ask for any visualisation in plain English. The AI reads your data and builds it — no code needed.</div>', unsafe_allow_html=True)
-
-        # Context-aware suggested prompts
-        std_prompts, adv_prompts = get_suggested_prompts(st.session_state.hypothesis, conv_cols_sot, sess_cols_sot, channels)
-        if std_prompts or adv_prompts:
-            st.markdown(f'<div style="font-size:10px;font-weight:600;color:{C["grey"]};letter-spacing:.08em;margin-bottom:6px">STANDARD</div>', unsafe_allow_html=True)
-            sug_cols = st.columns(4)
-            for idx_s, prompt_s in enumerate(std_prompts):
-                with sug_cols[idx_s % 4]:
-                    if st.button(f"💡 {prompt_s}", key=f"sug_std_{idx_s}", use_container_width=True):
-                        st.session_state.vs_queued = prompt_s
-                        st.rerun()
-            st.markdown(f'<div style="font-size:10px;font-weight:600;color:{C["grey"]};letter-spacing:.08em;margin:8px 0 6px">ADVANCED VISUALS</div>', unsafe_allow_html=True)
-            adv_cols = st.columns(3)
-            for idx_a, prompt_a in enumerate(adv_prompts):
-                with adv_cols[idx_a % 3]:
-                    if st.button(f"📊 {prompt_a}", key=f"sug_adv_{idx_a}", use_container_width=True):
-                        st.session_state.vs_queued = prompt_a
-                        st.rerun()
-
-        # Chat history
-        if "visual_studio_history" not in st.session_state:
-            st.session_state.visual_studio_history = []
-
-        for hi, turn in enumerate(st.session_state.visual_studio_history):
-            if turn["role"] == "user":
-                with st.chat_message("user"):
-                    st.write(turn["content"])
-            else:
-                with st.chat_message("assistant"):
-                    saved_spec = turn.get("spec", {})
-                    ct = saved_spec.get("chart_type", "text")
-                    if ct != "text" and saved_spec:
-                        fig_hist = render_chart_from_spec(
-                            saved_spec, df, pre_df, post_df,
-                            channels, ch_col, ch_lbl,
-                            t_start, t_end, CHART, C
-                        )
-                        if fig_hist:
-                            st.plotly_chart(fig_hist, use_container_width=True, key=f"vs_hist_{hi}")
-                    if turn.get("insight"):
-                        st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-top:6px;font-style:italic">💡 {turn["insight"]}</div>', unsafe_allow_html=True)
-                    if ct == "text" and turn.get("message"):
-                        st.write(turn["message"])
-
-        # Chat input + queued prompt processing
-        if not (st.session_state.ark_key and st.session_state.ark_endpoint):
-            st.markdown(f'<div style="font-size:12px;color:{C["amber"]};padding:10px 14px;background:{C["amber"]}11;border:1px solid {C["amber"]}44;border-radius:8px;margin-top:10px">Add your Ark API key and endpoint ID in the sidebar to enable Visual Studio.</div>', unsafe_allow_html=True)
-        else:
-            user_input_vs = st.chat_input("Ask for a visualisation — e.g. 'Show 7-day rolling TikTok conversions vs Direct'", key="vs_chat_input")
-            queued = st.session_state.pop("vs_queued", None)
-            active = queued or user_input_vs
-
-            if active:
-                st.session_state.visual_studio_history.append({"role": "user", "content": active})
-                with st.spinner("Building your chart..."):
-                    ctx = build_visual_context(df, pre_df, post_df, st.session_state.hypothesis,
-                                               conv_cols_sot, sess_cols_sot, rev_cols_sot, channels)
-                    spec_new, err_vs = call_ark_visual_studio(
-                        st.session_state.ark_key, st.session_state.ark_endpoint,
-                        active, ctx, st.session_state.visual_studio_history
-                    )
-                if err_vs:
-                    st.error(f"API error: {err_vs}")
-                elif spec_new:
-                    ct_new = spec_new.get("chart_type", "text")
-                    ins_new = spec_new.get("insight", "")
-                    fig_new = None
-                    if ct_new != "text":
-                        fig_new = render_chart_from_spec(
-                            spec_new, df, pre_df, post_df,
-                            channels, ch_col, ch_lbl,
-                            t_start, t_end, CHART, C
-                        )
-                    st.session_state.visual_studio_history.append({
-                        "role": "assistant",
-                        "spec": spec_new,
-                        "insight": ins_new,
-                        "message": spec_new.get("message", ""),
-                        "raw_response": json.dumps(spec_new),
-                    })
-                    with st.chat_message("assistant"):
-                        if fig_new:
-                            st.plotly_chart(fig_new, use_container_width=True, key="vs_new")
-                        if ins_new:
-                            st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-top:6px;font-style:italic">💡 {ins_new}</div>', unsafe_allow_html=True)
-                        if ct_new == "text":
-                            st.write(spec_new.get("message", "I couldn't build that chart from the available data — try rephrasing or ask for a different metric."))
-                    st.rerun()
-
+        # ── NAVIGATION ─────────────────────────────────────────────────────────
         sot_b1,sot_b2 = st.columns([1,5])
         with sot_b1:
             if st.button("Back",key="sot_eda_back"): st.session_state.step=3; st.rerun()
@@ -2873,90 +3439,333 @@ elif st.session_state.step == 5:
         if st.button("Continue to Export →", use_container_width=True): st.session_state.step=6; st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — SMOOTH & EXPORT
+# STEP 6 — MODEL SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.step == 6:
-    st.markdown(f'{badge("Step 6")} <span style="font-size:20px;font-weight:600;margin-left:10px">Smooth & Export</span>', unsafe_allow_html=True)
+    st.markdown(f'{badge("Step 6")} <span style="font-size:20px;font-weight:600;margin-left:10px">Model Setup</span>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["grey"]};margin-bottom:18px">Configure the CausalImpact model. Parameters are pre-filled from your earlier selections — adjust if needed before running.</div>', unsafe_allow_html=True)
 
     df = parse_dates(st.session_state.daily_df.copy())
-    target = st.session_state.target_col or next((c for c in df.columns if "conversion" in c.lower()), None)
     confirmed = [f for f in st.session_state.flag_vars if f.get("confirmed")]
     is_sot = st.session_state.file_type == "sot"
 
     for fv in confirmed:
         df[fv["name"]] = ((df["p_date"] >= pd.to_datetime(fv["start"])) & (df["p_date"] <= pd.to_datetime(fv["end"]))).astype(int)
 
-    # Smoothing (TTAM only)
+    # Smoothing toggle (TTAM only)
     smooth = False
+    w = 7
     if not is_sot:
-        cs, cw = st.columns([3,1])
+        cs, cw = st.columns([3, 1])
+        target_base = st.session_state.target_col or next((c for c in df.columns if "conversion" in c.lower()), None)
         with cs:
-            smooth = st.toggle(f"Apply rolling average smoothing to {target}", value=st.session_state.smoothing)
+            smooth = st.toggle(f"Apply rolling smoothing to target variable", value=st.session_state.smoothing)
             st.session_state.smoothing = smooth
         with cw:
             w = st.number_input("Window", value=st.session_state.smooth_window, min_value=3, max_value=14, step=1) if smooth else 7
             st.session_state.smooth_window = w
-        if smooth and target:
-            df[f"{target}_Smoothed"] = df[target].rolling(w, center=True, min_periods=3).mean()
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["p_date"],y=df[target],mode="lines",line=dict(color=C["grey"],width=1,dash="dot"),name="Raw",opacity=0.4))
-            fig.add_trace(go.Scatter(x=df["p_date"],y=df[f"{target}_Smoothed"],mode="lines",line=dict(color=C["purple"],width=2.5),name=f"{w}-day smoothed"))
-            fig.update_layout(**CHART,title=dict(text="Raw vs smoothed",font=dict(size=14)))
-            st.plotly_chart(fig,use_container_width=True)
+        if smooth and target_base:
+            df[f"{target_base}_Smoothed"] = df[target_base].rolling(w, center=True, min_periods=3).mean()
+            fig_sm = go.Figure()
+            fig_sm.add_trace(go.Scatter(x=df["p_date"], y=df[target_base], mode="lines",
+                line=dict(color=C["grey"], width=1, dash="dot"), name="Raw", opacity=0.4))
+            fig_sm.add_trace(go.Scatter(x=df["p_date"], y=df[f"{target_base}_Smoothed"], mode="lines",
+                line=dict(color=C["purple"], width=2.5), name=f"{w}-day smoothed"))
+            fig_sm.update_layout(**CHART, title=dict(text="Raw vs smoothed", font=dict(size=14)))
+            st.plotly_chart(fig_sm, use_container_width=True)
 
-    dep_var = f"{target}_Smoothed" if smooth and target else (target or "—")
+    num_cols = [c for c in df.columns if c != "p_date" and pd.api.types.is_numeric_dtype(df[c])]
 
-    # Build display values
-    adv = st.session_state.advertiser or "—"
-    pc  = st.session_state.parsed_context
-    flag_names    = ", ".join(f["name"] for f in confirmed) or "None"
-    spend_cats_str = ", ".join(c.replace("Cost","") for c in df.columns if c.endswith("Cost") and "Total" not in c) or "—"
-    smooth_note   = f"{w if smooth else 7}-day rolling avg on {target}" if smooth else "None"
-    cov_display   = ", ".join(c for c,r in st.session_state.sot_channel_roles.items() if r=="Covariate") if is_sot and st.session_state.sot_channel_roles else ", ".join(k for k,v in st.session_state.covariate_selection.items() if v) or "None selected"
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:13px;font-weight:600;color:{C["text"]};margin-bottom:12px">Model Configuration</div>', unsafe_allow_html=True)
 
-    # Build run instructions
-    if is_sot and st.session_state.sot_targets:
-        cov_sot = [c for c,r in st.session_state.sot_channel_roles.items() if r=="Covariate"]
-        runs_html = ""
-        for i, tgt in enumerate(st.session_state.sot_targets):
-            label = f"Run {i+1} — {'Primary' if i==0 else 'Secondary'}"
-            color = C["purple"] if i==0 else "#0891B2"
-            runs_html += f'<div style="border-left:3px solid {color};padding:7px 12px;margin:4px 0;background:{color}08;border-radius:0 6px 6px 0"><span style="font-size:11px;font-weight:700;color:{color}">{label}</span>  <span style="font-size:12px;color:{C["text"]}"><strong>{tgt}</strong></span>  <span style="font-size:11px;color:{C["grey"]}">· covariates: {", ".join(cov_sot) if cov_sot else "none"}</span></div>'
-    else:
-        runs_html = f'<div style="border-left:3px solid {C["purple"]};padding:7px 12px;margin:4px 0;background:{C["purple"]}08;border-radius:0 6px 6px 0"><span style="font-size:11px;font-weight:700;color:{C["purple"]}">Run 1</span>  <span style="font-size:12px;color:{C["text"]}"><strong>{dep_var}</strong></span>  <span style="font-size:11px;color:{C["grey"]}">· covariates: {cov_display}</span></div>'
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        default_target = st.session_state.target_col or (num_cols[0] if num_cols else None)
+        if smooth and default_target:
+            smoothed_name = f"{default_target}_Smoothed"
+            target_options = [smoothed_name] + [c for c in num_cols if c != smoothed_name]
+        else:
+            target_options = num_cols
+        target_sel = st.selectbox("Dependent variable (Y)", target_options, index=0, key="model_target")
+        st.session_state.target_col = target_sel
 
-    # Condensed config + run guide in one block
-    st.markdown(f"""<div class="card card-c">
-<div style="font-size:12px;font-weight:600;color:{C['purple']};margin-bottom:14px;letter-spacing:.05em">ANALYSIS SUMMARY & EXPORT</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;font-size:13px;margin-bottom:14px">
-  <div><span style="color:{C['grey']}">Advertiser</span><br><strong>{adv}</strong></div>
-  <div><span style="color:{C['grey']}">Data range</span><br><strong>{df['p_date'].min().strftime('%d %b %Y')} – {df['p_date'].max().strftime('%d %b %Y')}</strong></div>
-  <div><span style="color:{C['purple']};font-weight:600">Pre-period</span><br><strong>{str(st.session_state.pre_start) if st.session_state.pre_start else '—'} to {str(st.session_state.pre_end) if st.session_state.pre_end else '—'}</strong></div>
-  <div><span style="color:#059669;font-weight:600">Post-period</span><br><strong>{str(st.session_state.post_start) if st.session_state.post_start else '—'} to {str(st.session_state.post_end) if st.session_state.post_end else '—'}</strong></div>
-  <div><span style="color:{C['grey']}">Covariates</span><br><strong>{cov_display}</strong></div>
-  <div><span style="color:{C['grey']}">Flag variables</span><br><strong>{flag_names}</strong></div>
+        flag_cols  = [f["name"] for f in confirmed]
+        spend_cols = [c for c in num_cols if c.endswith("Cost") and c != "TotalCost"]
+        default_covs = [c for c in spend_cols + flag_cols if c in num_cols and c != target_sel]
+        cov_options  = [c for c in num_cols if c != target_sel]
+        covariates_sel = st.multiselect("Covariates", cov_options, default=default_covs, key="model_covs")
+        st.session_state.ci_covariates = covariates_sel
+
+    with mc2:
+        date_min = df["p_date"].min().date()
+        date_max = df["p_date"].max().date()
+        pre_s_def  = st.session_state.pre_start  or date_min
+        pre_e_def  = st.session_state.pre_end    or date_min
+        post_s_def = st.session_state.post_start or date_min
+        post_e_def = st.session_state.post_end   or date_max
+
+        pre_range  = st.date_input("Pre-period",  value=(pre_s_def,  pre_e_def),  min_value=date_min, max_value=date_max, key="model_pre")
+        post_range = st.date_input("Post-period", value=(post_s_def, post_e_def), min_value=date_min, max_value=date_max, key="model_post")
+        if len(pre_range)  == 2: st.session_state.pre_start,  st.session_state.pre_end  = pre_range
+        if len(post_range) == 2: st.session_state.post_start, st.session_state.post_end = post_range
+
+    # Validation warnings
+    pre_days_m  = (pd.Timestamp(st.session_state.pre_end)  - pd.Timestamp(st.session_state.pre_start)).days  + 1 if st.session_state.pre_start and st.session_state.pre_end else 0
+    post_days_m = (pd.Timestamp(st.session_state.post_end) - pd.Timestamp(st.session_state.post_start)).days + 1 if st.session_state.post_start and st.session_state.post_end else 0
+    w_html = ""
+    if pre_days_m < 30:
+        w_html += f'<div style="color:{C["amber"]};font-size:12px;margin-bottom:4px">⚠ Pre-period is {pre_days_m} days — minimum recommended is 30.</div>'
+    if pre_days_m > 0 and post_days_m > 0 and pre_days_m < 2 * post_days_m:
+        w_html += f'<div style="color:{C["amber"]};font-size:12px;margin-bottom:4px">⚠ Pre/post ratio is {pre_days_m/post_days_m:.1f}× — recommended ≥ 2×.</div>'
+    if w_html:
+        st.markdown(f'<div style="background:{C["amber"]}11;border:1px solid {C["amber"]}44;border-radius:8px;padding:10px 14px;margin:12px 0">{w_html}</div>', unsafe_allow_html=True)
+
+    cov_str = ", ".join(covariates_sel) if covariates_sel else "None (univariate)"
+    st.markdown(f"""<div class="card card-c" style="margin-top:16px">
+<div style="font-size:11px;font-weight:700;color:{C['grey']};letter-spacing:.08em;margin-bottom:10px">MODEL SPEC</div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px 24px;font-size:12px">
+  <div><span style="color:{C['grey']}">Target (Y)</span><br><strong style="color:{C['green']}">{target_sel}</strong></div>
+  <div><span style="color:{C['grey']}">Pre-period</span><br><strong>{str(st.session_state.pre_start)} → {str(st.session_state.pre_end)} ({pre_days_m}d)</strong></div>
+  <div><span style="color:{C['grey']}">Post-period</span><br><strong>{str(st.session_state.post_start)} → {str(st.session_state.post_end)} ({post_days_m}d)</strong></div>
+  <div style="grid-column:span 3"><span style="color:{C['grey']}">Covariates</span><br><strong>{cov_str}</strong></div>
 </div>
-<div style="font-size:11px;font-weight:700;color:{C['grey']};letter-spacing:.08em;margin-bottom:6px">LOAD INTO ANALYSIS TOOL</div>
-{runs_html}
+<div style="font-size:11px;color:{C['grey_l']};margin-top:10px">BSTS · niter=1000 · nseasons=7 · weekly seasonality</div>
 </div>""", unsafe_allow_html=True)
 
-    # Download + reset
-    out = df.copy(); out["p_date"] = out["p_date"].dt.strftime("%Y-%m-%d")
-    safe  = (st.session_state.advertiser or "advertiser").replace(" ","_")
-    fname = f"{safe}_AnalysisInput_{datetime.today().strftime('%Y%m%d')}.csv"
-    csv_bytes = out.to_csv(index=False).encode("utf-8")
+    st.markdown("<br>", unsafe_allow_html=True)
+    cb1, cb2, cb3 = st.columns([1, 2, 2])
+    with cb1:
+        if st.button("← Back"): st.session_state.step = 5; st.rerun()
+    with cb2:
+        run_model = st.button("▶ Run CausalImpact Model", type="primary", use_container_width=True)
+    with cb3:
+        out_csv = df.copy(); out_csv["p_date"] = out_csv["p_date"].dt.strftime("%Y-%m-%d")
+        safe_n = (st.session_state.advertiser or "advertiser").replace(" ", "_")
+        fname_csv = f"{safe_n}_AnalysisInput_{datetime.today().strftime('%Y%m%d')}.csv"
+        st.download_button("↓ Export CSV instead", data=out_csv.to_csv(index=False).encode("utf-8"),
+                           file_name=fname_csv, mime="text/csv", use_container_width=True)
 
-    dl_col, rs_col = st.columns([3,1])
-    with dl_col:
-        st.download_button(f"Download CSV — {fname}", data=csv_bytes, file_name=fname, mime="text/csv", use_container_width=True)
-    with rs_col:
-        if st.button("Start new analysis", use_container_width=True):
-            for k in list(st.session_state.keys()): del st.session_state[k]
-            st.rerun()
+    if run_model:
+        if not (st.session_state.pre_start and st.session_state.pre_end and
+                st.session_state.post_start and st.session_state.post_end):
+            st.error("Please set pre and post periods before running.")
+        else:
+            with st.spinner("Running BSTS model… (~15–30 seconds)"):
+                ci_obj, ci_err = run_causal_impact(
+                    df, target_sel, covariates_sel,
+                    st.session_state.pre_start, st.session_state.pre_end,
+                    st.session_state.post_start, st.session_state.post_end
+                )
+            if ci_err:
+                st.error(f"Model error: {ci_err}")
+                if "not installed" in ci_err:
+                    st.code("pip3 install causalimpact")
+            else:
+                ape_tbl, mape_val = compute_pre_ape_table(ci_obj, st.session_state.pre_start, st.session_state.pre_end)
+                pv = getattr(ci_obj, '_extracted_p_value', None) or getattr(ci_obj, 'p_value', None)
+                sigs = build_diagnostic_signals(
+                    ci_obj, ape_tbl, mape_val, pv,
+                    st.session_state.pre_start, st.session_state.pre_end,
+                    st.session_state.post_start, st.session_state.post_end
+                )
+                try:
+                    sd = ci_obj.summary_data
+                    avg_d = sd.get('average', {}) if isinstance(sd, dict) else {}
+                    cum_d = sd.get('cumulative', {}) if isinstance(sd, dict) else {}
+                except Exception:
+                    avg_d, cum_d = {}, {}
 
-    with st.expander(f"Preview dataset ({len(df)} rows · {len(df.columns)} columns)"):
-        prev = df.copy(); prev["p_date"] = prev["p_date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(prev.head(15), use_container_width=True, height=280)
+                st.session_state.ci_result       = ci_obj
+                st.session_state.ci_mape          = mape_val
+                st.session_state.ci_ape_df        = ape_tbl
+                st.session_state.ci_p_value       = pv
+                st.session_state.ci_signals       = sigs
+                st.session_state.ci_summary_data  = {'average': avg_d, 'cumulative': cum_d}
+                st.session_state.ci_llm_diagnosis = None
+                st.session_state.ci_narrator      = None
+                st.session_state.ci_run_count    += 1
+                st.session_state.step = 7
+                st.rerun()
 
-    if st.button("← Back"): st.session_state.step=5; st.rerun()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — RESULTS & DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════════════════════
+elif st.session_state.step == 7:
+    st.markdown(f'{badge("Step 7")} <span style="font-size:20px;font-weight:600;margin-left:10px">Results & Diagnostics</span>', unsafe_allow_html=True)
+
+    ci_r   = st.session_state.ci_result
+    mape_r = st.session_state.ci_mape
+    pval_r = st.session_state.ci_p_value
+    ape_r  = st.session_state.ci_ape_df
+    sigs_r = st.session_state.ci_signals or []
+
+    if ci_r is None:
+        st.warning("No model result found. Go back and run the model.")
+        if st.button("← Back to Model Setup"): st.session_state.step = 6; st.rerun()
+    else:
+        tgt_name = st.session_state.target_col or "target"
+
+        # ── Summary tiles ──
+        try:
+            sd_r  = st.session_state.ci_summary_data or {}
+            avg_r = sd_r.get('average', {})
+            cum_r = sd_r.get('cumulative', {})
+            actual_avg  = avg_r.get('actual', None)
+            pred_avg    = avg_r.get('predicted', None)
+            abs_eff_avg = avg_r.get('abs_effect', None)
+            rel_eff     = avg_r.get('rel_effect', None)
+            cum_effect  = cum_r.get('abs_effect', None)
+            # Fallback: compute directly from inferences if summary_data empty
+            if actual_avg is None and ci_r is not None:
+                inf = ci_r.inferences
+                obs  = next((c for c in ['y','response','observed','actual']       if c in inf.columns), None)
+                pred = next((c for c in ['y_pred','point_pred','predicted','yhat'] if c in inf.columns), None)
+                post_inf = inf[inf.index >= pd.Timestamp(st.session_state.post_start)]
+                if obs:  actual_avg  = float(pd.to_numeric(post_inf[obs],  errors='coerce').mean())
+                if pred: pred_avg    = float(pd.to_numeric(post_inf[pred], errors='coerce').mean())
+                if obs and pred:
+                    abs_eff_avg = actual_avg - pred_avg if actual_avg and pred_avg else None
+                    rel_eff     = (abs_eff_avg / pred_avg) if pred_avg and pred_avg != 0 else None
+                    cum_effect  = float(pd.to_numeric(post_inf[obs] - post_inf[pred], errors='coerce').sum())
+        except Exception:
+            actual_avg = pred_avg = abs_eff_avg = rel_eff = cum_effect = None
+
+        def fmt_v(v, dec=1, pct=False, sign=False):
+            if v is None: return "—"
+            if pct: return f"{v*100:+.{dec}f}%" if sign else f"{v*100:.{dec}f}%"
+            return f"{v:+,.{dec}f}" if sign else f"{v:,.{dec}f}"
+
+        sig_c  = C["green"]  if (pval_r is not None and pval_r <= 0.05) else C["amber"]
+        mape_c = C["green"]  if (mape_r is not None and mape_r <= 10)  else C["amber"] if (mape_r is not None and mape_r <= 15) else C["red"]
+        rel_c  = C["green"]  if rel_eff is not None and rel_eff > 0    else C["red"]
+
+        st.markdown(f"""<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:20px">
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Avg Actual</div><div style="font-size:22px;font-weight:700;color:{C['text']}">{fmt_v(actual_avg)}</div></div>
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Avg Predicted</div><div style="font-size:22px;font-weight:700;color:{C['text']}">{fmt_v(pred_avg)}</div></div>
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Avg Daily Lift</div><div style="font-size:22px;font-weight:700;color:{rel_c}">{fmt_v(abs_eff_avg, sign=True)}</div></div>
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Relative Lift</div><div style="font-size:22px;font-weight:700;color:{rel_c}">{fmt_v(rel_eff, pct=True, sign=True)}</div></div>
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">p-value</div><div style="font-size:22px;font-weight:700;color:{sig_c}">{f'{pval_r:.4f}' if pval_r is not None else '—'}</div></div>
+  <div class="card" style="text-align:center;padding:14px 8px"><div style="font-size:10px;color:{C['grey']};text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Pre MAPE</div><div style="font-size:22px;font-weight:700;color:{mape_c}">{f'{mape_r:.1f}%' if mape_r is not None else '—'}</div></div>
+</div>""", unsafe_allow_html=True)
+
+        # ── Three-panel chart ──
+        try:
+            fig_ci = build_three_panel_chart(ci_r, st.session_state.post_start, tgt_name)
+            st.plotly_chart(fig_ci, use_container_width=True)
+        except Exception as chart_err:
+            st.error(f"Chart error: {chart_err}")
+
+        # ── APE table + LLM diagnostics ──
+        col_l, col_r = st.columns([1, 1])
+
+        with col_l:
+            st.markdown(f'<div style="font-size:13px;font-weight:600;color:{C["text"]};margin-bottom:8px">Pre-period Daily APE</div>', unsafe_allow_html=True)
+            if ape_r is not None and not ape_r.empty:
+                def _ape_style(val):
+                    try:
+                        v = float(val)
+                        if v > 25: return f'color: {C["red"]}'
+                        if v > 15: return f'color: {C["amber"]}'
+                        return f'color: {C["green"]}'
+                    except: return ''
+                st.dataframe(ape_r.style.map(_ape_style, subset=['APE (%)']),
+                             use_container_width=True, height=340, hide_index=True)
+                st.markdown(f'<div style="font-size:12px;color:{mape_c};margin-top:4px;font-weight:600">Overall MAPE: {mape_r:.2f}%</div>', unsafe_allow_html=True)
+
+        with col_r:
+            st.markdown(f'<div style="font-size:13px;font-weight:600;color:{C["text"]};margin-bottom:8px">AI Diagnostic Layer</div>', unsafe_allow_html=True)
+
+            critical_s = [s for s in sigs_r if s.get('severity') == 'critical']
+            warn_s     = [s for s in sigs_r if s.get('severity') == 'warning']
+            all_issues = critical_s + warn_s
+
+            if not all_issues:
+                st.markdown(f'<div style="background:{C["green"]}11;border:1px solid {C["green"]}33;border-radius:8px;padding:14px 16px"><div style="font-size:13px;font-weight:600;color:{C["green"]};margin-bottom:4px">✓ Model looks clean</div><div style="font-size:12px;color:{C["grey"]}">No critical issues detected. MAPE and significance are within acceptable thresholds.</div></div>', unsafe_allow_html=True)
+            else:
+                for sig in all_issues:
+                    sc = C["red"] if sig.get('severity') == 'critical' else C["amber"]
+                    st.markdown(f'<div style="border-left:3px solid {sc};padding:8px 12px;margin-bottom:6px;background:{sc}11;border-radius:0 6px 6px 0"><div style="font-size:11px;color:{sc};font-weight:600;text-transform:uppercase;letter-spacing:.06em">{sig.get("type","").replace("_"," ")}</div><div style="font-size:12px;color:{C["text"]};margin-top:2px">{sig.get("message","")}</div></div>', unsafe_allow_html=True)
+
+                if st.session_state.ci_llm_diagnosis is None:
+                    if st.button("🔍 Get AI diagnosis + fixes", type="primary", key="llm_diag"):
+                        with st.spinner("Analysing model issues..."):
+                            pd_days = (pd.Timestamp(st.session_state.pre_end) - pd.Timestamp(st.session_state.pre_start)).days + 1 if st.session_state.pre_start and st.session_state.pre_end else "?"
+                            po_days = (pd.Timestamp(st.session_state.post_end) - pd.Timestamp(st.session_state.post_start)).days + 1 if st.session_state.post_start and st.session_state.post_end else "?"
+                            ctx_d = {
+                                "hypothesis": st.session_state.hypothesis or "unknown",
+                                "advertiser": st.session_state.advertiser or "unknown",
+                                "pre_start":  str(st.session_state.pre_start),
+                                "pre_end":    str(st.session_state.pre_end),
+                                "post_start": str(st.session_state.post_start),
+                                "post_end":   str(st.session_state.post_end),
+                                "pre_days":   pd_days,
+                                "post_days":  po_days,
+                                "target":     tgt_name,
+                                "covariates": str(st.session_state.ci_covariates),
+                                "mape":       round(mape_r, 2) if mape_r else "?",
+                                "p_value":    round(pval_r, 4) if pval_r else "?",
+                            }
+                            st.session_state.ci_llm_diagnosis = call_llm_diagnostic(sigs_r, ctx_d)
+                            st.rerun()
+                else:
+                    diag_d = st.session_state.ci_llm_diagnosis
+                    if diag_d:
+                        sev_d = diag_d.get('overall_severity', 'warning')
+                        sev_dc = C["red"] if sev_d == "critical" else C["amber"]
+                        st.markdown(f'<div style="background:{C["surface2"]};border:1px solid {C["border"]};border-radius:8px;padding:14px 16px;margin-bottom:10px"><div style="font-size:13px;font-weight:700;color:{sev_dc};margin-bottom:6px">{diag_d.get("headline","")}</div><div style="font-size:12px;color:{C["text"]};line-height:1.7">{diag_d.get("diagnosis","")}</div></div>', unsafe_allow_html=True)
+                        for fix in diag_d.get('fixes', []):
+                            st.markdown(f'<div style="border:1px solid {C["border"]};border-radius:6px;padding:10px 12px;margin-bottom:6px"><div style="font-size:12px;font-weight:600;color:{C["purple"]};margin-bottom:3px">#{fix.get("rank","")} — {fix.get("action","")}</div><div style="font-size:11px;color:{C["grey"]}">{fix.get("rationale","")}</div></div>', unsafe_allow_html=True)
+                        if st.button("↺ Re-diagnose", key="rediag"):
+                            st.session_state.ci_llm_diagnosis = None; st.rerun()
+
+        # ── Results narrator ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("✍ Generate client narrative (for slide notes)"):
+            if st.session_state.ci_narrator is None:
+                if st.button("Generate narrative", key="narrator_btn"):
+                    with st.spinner("Writing client narrative..."):
+                        ci_sum_n = {
+                            "rel_effect_pct": f"{rel_eff*100:+.1f}" if rel_eff is not None else "?",
+                            "cum_effect": f"{cum_effect:,.0f}" if cum_effect is not None else "?",
+                            "p_value": f"{pval_r:.4f}" if pval_r is not None else "?",
+                            "mape": f"{mape_r:.1f}" if mape_r is not None else "?",
+                        }
+                        ctx_n = {
+                            "advertiser": st.session_state.advertiser,
+                            "hypothesis": st.session_state.hypothesis,
+                            "post_start": str(st.session_state.post_start),
+                            "post_end":   str(st.session_state.post_end),
+                            "target":     tgt_name,
+                        }
+                        st.session_state.ci_narrator = call_llm_narrator(ci_sum_n, ctx_n)
+                        st.rerun()
+            else:
+                narr_d = st.session_state.ci_narrator
+                if narr_d:
+                    for nk, nl in [("headline","Headline"), ("what_happened","What happened"),
+                                   ("business_meaning","Business meaning"), ("methodology_note","Methodology"), ("caveat","Caveat")]:
+                        nv = narr_d.get(nk)
+                        if nv:
+                            st.markdown(f'<div style="margin-bottom:10px"><div style="font-size:10px;color:{C["grey"]};text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">{nl}</div><div style="font-size:13px;color:{C["text"]};line-height:1.7">{nv}</div></div>', unsafe_allow_html=True)
+                if st.button("↺ Regenerate", key="regen_narr"):
+                    st.session_state.ci_narrator = None; st.rerun()
+
+        # ── Bottom nav ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        bn1, bn2, bn3 = st.columns([1, 2, 2])
+        with bn1:
+            if st.button("← Back"): st.session_state.step = 6; st.rerun()
+        with bn2:
+            if st.button("↺ Re-run with different config", use_container_width=True):
+                st.session_state.ci_result = None; st.session_state.step = 6; st.rerun()
+        with bn3:
+            df_exp = parse_dates(st.session_state.daily_df.copy())
+            for fv in [f for f in st.session_state.flag_vars if f.get("confirmed")]:
+                df_exp[fv["name"]] = ((df_exp["p_date"] >= pd.to_datetime(fv["start"])) & (df_exp["p_date"] <= pd.to_datetime(fv["end"]))).astype(int)
+            df_exp["p_date"] = df_exp["p_date"].dt.strftime("%Y-%m-%d")
+            safe_e = (st.session_state.advertiser or "advertiser").replace(" ", "_")
+            fname_e = f"{safe_e}_CausalInput_{datetime.today().strftime('%Y%m%d')}.csv"
+            st.download_button("↓ Export clean CSV", data=df_exp.to_csv(index=False).encode("utf-8"),
+                               file_name=fname_e, mime="text/csv", use_container_width=True)
