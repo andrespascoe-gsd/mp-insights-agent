@@ -1,0 +1,37 @@
+[
+  {
+    "date": "2026-05-13",
+    "advertiser": "Unknown",
+    "hypothesis_type": "incrementality",
+    "brief_summary": "# Babyboo \u2014 Causal Analysis Brief\n**Submitted by:** Nikki Strover-Wood \u00b7 KA3 Fashion team  \n**Budget:** $470,000  \n**Study window:** 1 Mar 2026 \u2013 6 May 2026\n\n---\n\n## Hypothesis\n\n> **Running Smart+ Catalog does not cannibalise Non-Catalog conversions \u2014 it grows the total conversion pool.**\n\nThe client believes Smart+ Catalog is stealing volume from their other ad formats. We need to prove the opposite: that the Catalog scale period lifted total conversions, while Non-Catalog conversions held steady or grew.\n\n---\n\n## What We're Proving (Two-Pronged)\n\n| Claim | How we prove it |\n|-------|----------------|\n| S+ Catalog drives **incremental conversions** | Causal model shows a statistically significant lift in total conversions during the intervention window |\n| S+ Catalog does **not cannibalis",
+    "confounders": [
+      "Facebook",
+      "Google Ads",
+      "Snapchat"
+    ],
+    "promo_events": [
+      "New Season Sale",
+      "End of Year Event"
+    ],
+    "analytical_risk": "very_high",
+    "two_model_needed": true,
+    "outcome_notes": "MAPE=11.8%, p=0.0000"
+  },
+  {
+    "date": "2026-05-15",
+    "advertiser": "babyboo",
+    "hypothesis_type": "incrementality",
+    "brief_summary": "# Babyboo \u2014 Causal Analysis Brief v2\n**Submitted by:** Nikki Strover-Wood \u00b7 KA3 Fashion team\n**Budget:** $470,000\n**Study window:** 17 Jan 2026 \u2013 30 Apr 2026\n**Brief updated:** 14 May 2026\n\n---\n\n## Hypothesis\n\n> **Running Smart+ Catalog does not cannibalise Non-Catalog conversions \u2014 it grows the total conversion pool.**\n\nThe client believes Smart+ Catalog is stealing volume from their other ad formats. We need to prove the opposite: that the Catalog scale period lifted total conversions, while Non-Catalog conversions held steady or grew.\n\n---\n\n## What We're Proving (Two-Pronged)\n\n| Claim | How we prove it |\n|-------|----------------|\n| S+ Catalog drives **incremental conversions** | Causal model shows a statistically significant lift in total conversions during the intervention window |\n| ",
+    "confounders": [
+      "Meta",
+      "Google"
+    ],
+    "promo_events": [
+      "New Season Sale",
+      "Push List Sale"
+    ],
+    "analytical_risk": "very_high",
+    "two_model_needed": true,
+    "outcome_notes": "MAPE=8.0%, p=0.0000"
+  }
+]
