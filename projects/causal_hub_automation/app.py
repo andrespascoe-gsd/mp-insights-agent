@@ -475,9 +475,15 @@ def build_eda_summary(df, pre_df, post_df, hypothesis, file_type, channel_roles,
         lines.append("")
         lines.append("CONVERSION RATES (CVR) - conversions / sessions:")
         ch_order = ["Direct","Paid_Social_TikTok","Paid_Search_Google","Paid_Social_Meta","Organic_Search"]
+        _CH_ALT_PFX = {
+            "Direct": ["direct_"], "Paid_Social_TikTok": ["tiktok_"],
+            "Paid_Search_Google": ["google_cpc_"], "Paid_Social_Meta": ["meta_"],
+            "Organic_Search": ["organic_"],
+        }
         for ch in ch_order:
-            s_col = next((c for c in df.columns if c.startswith(ch) and "Sessions" in c), None)
-            c_col = next((c for c in df.columns if c.startswith(ch) and "Conversions" in c), None)
+            _pfx = [ch + "_"] + _CH_ALT_PFX.get(ch, [])
+            s_col = next((c for c in df.columns if any(c.startswith(p) for p in _pfx) and "session" in c.lower()), None)
+            c_col = next((c for c in df.columns if any(c.startswith(p) for p in _pfx) and "conversion" in c.lower()), None)
             if s_col and c_col and s_col in pre_df.columns and c_col in pre_df.columns:
                 pre_cvr  = pre_df[c_col].sum()  / pre_df[s_col].sum()  * 100 if pre_df[s_col].sum()  > 0 else 0
                 post_cvr = post_df[c_col].sum() / post_df[s_col].sum() * 100 if len(post_df) > 0 and post_df[s_col].sum() > 0 else 0
@@ -1612,9 +1618,6 @@ CH_NAME_MAP = {
     # Other / catch-all
     "other":                   "Other",
     "others":                  "Other",
-    # Grand Total — kept so it parses cleanly; users can exclude it in col selection
-    "grand total":             "Grand_Total",
-    "total":                   "Grand_Total",
 }
 
 METRIC_NAME_MAP = {
@@ -1810,18 +1813,24 @@ def normalise_file(file_obj_or_bytes, filename="file.csv"):
                         df.columns[0])
         df = df.rename(columns={date_col: "p_date"})
 
-        # Rename flat columns to canonical
-        rename = {}
-        for col in df.columns:
-            if col == "p_date": continue
-            cl = col.lower().replace(" ","_").replace("-","_")
-            ch_f = next((v for k,v in CH_NAME_MAP.items()
-                         if k.replace(" ","_").replace("-","_") in cl), None)
-            met_f = next((v for k,v in METRIC_NAME_MAP.items() if k in cl), None)
-            if ch_f and met_f:
-                new = f"{ch_f}_{met_f}"
-                if new not in rename.values(): rename[col] = new
-        if rename: df = df.rename(columns=rename)
+        # If the dataset already has ttam_* or flag_* columns it's pre-cleaned —
+        # skip renaming entirely so no duplicate/mangled column names appear.
+        _is_pre_cleaned = any(
+            c.lower().startswith("ttam_") or c.lower().startswith("flag_")
+            for c in df.columns
+        )
+        if not _is_pre_cleaned:
+            rename = {}
+            for col in df.columns:
+                if col == "p_date": continue
+                cl = col.lower().replace(" ","_").replace("-","_")
+                ch_f = next((v for k,v in CH_NAME_MAP.items()
+                             if k.replace(" ","_").replace("-","_") in cl), None)
+                met_f = next((v for k,v in METRIC_NAME_MAP.items() if k in cl), None)
+                if ch_f and met_f:
+                    new = f"{ch_f}_{met_f}"
+                    if new not in rename.values(): rename[col] = new
+            if rename: df = df.rename(columns=rename)
 
         for c in df.columns:
             if c == "p_date": continue
@@ -1870,10 +1879,12 @@ def parse_sot_columns(df):
                 channels.setdefault(ck, []).append(col)
                 matched = True; break
         if not matched:
-            # Fuzzy fallback for non-normalised files
+            # Fuzzy fallback for pre-cleaned files — use startswith to avoid
+            # "tt" matching "ttam_*" or "tiktok" matching "non_tiktok_*"
             cl = col.lower().replace(" ","_").replace("-","_")
             for k, v in CH_NAME_MAP.items():
-                if k.replace(" ","_").replace("-","_") in cl:
+                kn = k.replace(" ","_").replace("-","_")
+                if cl.startswith(kn + "_") or cl == kn:
                     channels.setdefault(v, []).append(col)
                     matched = True; break
         if not matched:
@@ -2058,11 +2069,10 @@ with st.sidebar:
 
     # Sidebar shows logical groups mapping to internal steps
     LOGICAL_STEPS = [
-        ("1 · Upload",    [0],       0),
-        ("2 · Configure", [2],       2),
-        ("3 · Explore",   [1, 4],    1),
-        ("4 · Model",     [5, 6],    6),
-        ("5 · Results",   [7],       7),
+        ("1 · Upload",  [0],    0),
+        ("2 · Explore", [4],    4),
+        ("3 · Model",   [6],    6),
+        ("4 · Results", [7],    7),
     ]
     cur = st.session_state.step
     st.session_state.max_step = max(st.session_state.get("max_step", 0), cur)
@@ -2084,12 +2094,9 @@ with st.sidebar:
             st.markdown(f'<div style="padding:8px 12px;border-radius:6px;margin:2px 0;color:{C["grey_l"]};font-size:13px;opacity:0.45;cursor:default">{label}</div>', unsafe_allow_html=True)
 
     st.markdown("<hr>", unsafe_allow_html=True)
-    # LLM hardcoded to Groq for POC
     st.session_state.ark_key      = GROQ_API_KEY
     st.session_state.ark_endpoint = OPENAI_DEFAULT_MODEL
     globals()["ARK_BASE_URL"]     = "https://api.groq.com/openai/v1/"
-    st.markdown(pill("✓ Groq AI connected", "pill-c"), unsafe_allow_html=True)
-    st.markdown(f'<div style="font-size:10px;color:{C["grey_l"]};margin-top:3px">llama-3.3-70b-versatile</div>', unsafe_allow_html=True)
 
     if st.session_state.daily_df is not None:
         df_ = parse_dates(st.session_state.daily_df)
@@ -2359,7 +2366,7 @@ if st.session_state.step == 0:
     st.markdown(f'''<div style="text-align:center;padding:32px 0 24px">
       <div style="font-size:30px;margin-bottom:10px">🎯</div>
       <div style="font-size:26px;font-weight:700;color:{C['text']};margin-bottom:6px">TikTok Causal Hub</div>
-      <div style="font-size:14px;color:{C['grey']};max-width:480px;margin:0 auto">Paste the brief and upload your data. The AI will read both and derive the hypothesis before you touch a model.</div>
+      <div style="font-size:14px;color:{C['grey']};max-width:480px;margin:0 auto">Paste the brief for context, upload your data, then explore and model.</div>
     </div>''', unsafe_allow_html=True)
 
     col_left, col_right = st.columns([3, 2], gap="large")
@@ -2481,8 +2488,7 @@ if st.session_state.step == 0:
             st.session_state.advertiser = adv
         with btn_c:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Analyse", use_container_width=True, type="primary"):
-                # Aggregate TTAM if needed (use default L4 map + broad conv events)
+            if st.button("Continue to Explore →", use_container_width=True, type="primary"):
                 if st.session_state.file_type == "raw_ttam":
                     try:
                         _default_conv = ["Complete Payment", "Purchase", "Checkout", "Submit Form", "App Install"]
@@ -2490,13 +2496,10 @@ if st.session_state.step == 0:
                         st.session_state.daily_df = agg
                     except Exception as _agg_e:
                         st.session_state.daily_df = st.session_state.raw_df.copy()
-                elif st.session_state.file_type == "sot":
-                    st.session_state.daily_df = st.session_state.raw_df.copy()
                 else:
                     st.session_state.daily_df = st.session_state.raw_df.copy()
-                st.session_state.ai_synthesis = None
-                st.session_state.step = 2
-                st.session_state.max_step = max(st.session_state.max_step, 2)
+                st.session_state.step = 4
+                st.session_state.max_step = max(st.session_state.max_step, 4)
                 st.rerun()
 
 elif st.session_state.step == 1:
@@ -3198,32 +3201,88 @@ elif st.session_state.step == 3:
 # STEP 4 — EDA
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.step == 4:
-    st.markdown(f'{badge("Step 4")} <span style="font-size:20px;font-weight:600;margin-left:10px">Exploratory Analysis</span>', unsafe_allow_html=True)
+    st.markdown(f'<span style="font-size:20px;font-weight:600">Explore</span>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["grey"]};margin-bottom:16px;font-size:13px">Set your analysis window, choose a target variable, and explore the data before modelling.</div>', unsafe_allow_html=True)
 
     df = parse_dates(st.session_state.daily_df.copy())
 
-    # SOT EDA — early exit before TTAM code
-    if st.session_state.file_type == "sot" and st.session_state.daily_df is not None:
-        t_start = pd.Timestamp(st.session_state.post_start) if st.session_state.post_start else None
-        t_end   = pd.Timestamp(st.session_state.post_end)   if st.session_state.post_end   else None
-        pre_df  = df[df["p_date"] < t_start]  if t_start is not None else df.copy()
-        post_df = df[(df["p_date"] >= t_start) & (df["p_date"] <= t_end)] if t_start is not None else pd.DataFrame()
+    # ── CONTROL BAR ────────────────────────────────────────────────────────────
+    _date_min = df["p_date"].min().date()
+    _date_max = df["p_date"].max().date()
+    _total_days = (_date_max - _date_min).days + 1
+    _split = int(_total_days * 0.6)
+    if st.session_state.pre_start  is None: st.session_state.pre_start  = _date_min
+    if st.session_state.pre_end    is None: st.session_state.pre_end    = _date_min + pd.Timedelta(days=_split - 1)
+    if st.session_state.post_start is None: st.session_state.post_start = _date_min + pd.Timedelta(days=_split)
+    if st.session_state.post_end   is None: st.session_state.post_end   = _date_max
 
-        conv_cols_sot = [c for c in df.columns if "Conversions" in c]
-        sess_cols_sot = [c for c in df.columns if "Sessions" in c]
-        rev_cols_sot  = [c for c in df.columns if "Revenue" in c]
+    _num_cols_e = [c for c in df.columns if c != "p_date" and pd.api.types.is_numeric_dtype(df[c])]
+    _pref_kws_e = ["conversion","conv","purchase","order","revenue","sales","session"]
+    _sorted_cols_e = sorted(_num_cols_e, key=lambda c: next((i for i,kw in enumerate(_pref_kws_e) if kw in c.lower()), len(_pref_kws_e)))
+
+    _eb1, _eb2, _eb3, _eb4, _eb5 = st.columns([2, 2, 2, 2, 3])
+    with _eb1: _pre_s  = st.date_input("Pre start",  value=st.session_state.pre_start,  min_value=_date_min, max_value=_date_max, key="exp_pre_s")
+    with _eb2: _pre_e  = st.date_input("Pre end",    value=st.session_state.pre_end,    min_value=_date_min, max_value=_date_max, key="exp_pre_e")
+    with _eb3: _post_s = st.date_input("Post start", value=st.session_state.post_start, min_value=_date_min, max_value=_date_max, key="exp_post_s")
+    with _eb4: _post_e = st.date_input("Post end",   value=st.session_state.post_end,   min_value=_date_min, max_value=_date_max, key="exp_post_e")
+    with _eb5:
+        _tgt_def_e = st.session_state.target_col if st.session_state.target_col in _sorted_cols_e else (_sorted_cols_e[0] if _sorted_cols_e else None)
+        _tgt_e = st.selectbox("Target variable", _sorted_cols_e,
+            index=_sorted_cols_e.index(_tgt_def_e) if _tgt_def_e in _sorted_cols_e else 0,
+            format_func=lambda c: c.replace("_"," "), key="exp_target")
+
+    st.session_state.pre_start  = _pre_s
+    st.session_state.pre_end    = _pre_e
+    st.session_state.post_start = _post_s
+    st.session_state.post_end   = _post_e
+    st.session_state.target_col = _tgt_e
+
+    try:
+        _pre_days_e  = (_pre_e  - _pre_s).days  + 1
+        _post_days_e = (_post_e - _post_s).days + 1
+        _ratio_e     = _pre_days_e / _post_days_e if _post_days_e > 0 else 0
+        _rc_e = C["green"] if _ratio_e >= 2 else C["amber"] if _ratio_e >= 1 else C["red"]
+        _rn_e = "✓ Good" if _ratio_e >= 2 else "⚠ Borderline" if _ratio_e >= 1 else "✗ Too short"
+    except Exception:
+        _pre_days_e = _post_days_e = 0; _ratio_e = 0; _rc_e = C["red"]; _rn_e = "—"
+    st.markdown(
+        f'<div style="display:flex;gap:10px;margin:8px 0 20px;flex-wrap:wrap">'
+        f'<div style="background:{C["purple"]}15;border:1px solid {C["purple"]}30;border-radius:8px;padding:5px 12px;font-size:12px;color:{C["purple"]}"><strong>Pre:</strong> {_pre_days_e}d</div>'
+        f'<div style="background:{C["surface2"]};border:1px solid {C["border"]};border-radius:8px;padding:5px 12px;font-size:12px;color:{C["text"]}"><strong>Post:</strong> {_post_days_e}d</div>'
+        f'<div style="background:{_rc_e}15;border:1px solid {_rc_e}40;border-radius:8px;padding:5px 12px;font-size:12px;font-weight:700;color:{_rc_e}">Ratio {_ratio_e:.1f}× — {_rn_e}</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    t_start = pd.Timestamp(_post_s) if _post_s else None
+    t_end   = pd.Timestamp(_post_e) if _post_e else None
+    pre_df  = df[df["p_date"] < t_start]  if t_start is not None else df.copy()
+    post_df = df[(df["p_date"] >= t_start) & (df["p_date"] <= t_end)] if t_start is not None else pd.DataFrame()
+
+    if st.session_state.file_type in ("sot", "pre_aggregated"):
+        # Shared channel/metric column lists
+        conv_cols_sot = [c for c in df.columns if "conversions" in c.lower() and not c.lower().startswith("ttam_")]
+        sess_cols_sot = [c for c in df.columns if "sessions"    in c.lower() and not c.lower().startswith("ttam_")]
+        rev_cols_sot  = [c for c in df.columns if "revenue"     in c.lower() and not c.lower().startswith("ttam_")]
 
         CH_ORDER  = ["Direct","Paid_Social_TikTok","Paid_Search_Google","Paid_Social_Meta","Organic_Search"]
-        CH_COLORS = {"Direct":C["purple"],"Paid_Social_TikTok":"#00D8FF","Paid_Search_Google":"#FF7070","Paid_Social_Meta":"#5BA8FF","Organic_Search":"#4AE882","Organic":"#4AE882"}
+        CH_COLORS = {"Direct":C["purple"],"Paid_Social_TikTok":"#00D8FF","Paid_Search_Google":"#FF7070","Paid_Social_Meta":"#5BA8FF","Organic_Search":"#4AE882"}
         def ch_col(ch): return CH_COLORS.get(ch, C["grey"])
         def ch_lbl(ch): return ch.replace("Paid_Social_","").replace("Paid_Search_","").replace("_Search","").replace("_"," ")
 
+        _CH_PREFIXES = [
+            ("Direct_","Direct"),("direct_","Direct"),
+            ("Paid_Social_TikTok_","Paid_Social_TikTok"),("tiktok_","Paid_Social_TikTok"),
+            ("Paid_Search_Google_","Paid_Search_Google"),("google_cpc_","Paid_Search_Google"),
+            ("Paid_Social_Meta_","Paid_Social_Meta"),("meta_","Paid_Social_Meta"),
+            ("Organic_Search_","Organic_Search"),("organic_","Organic_Search"),
+        ]
         channels = {}
-        for col in df.columns:
-            if col == "p_date": continue
-            for ch in CH_ORDER:
-                if col.startswith(ch):
-                    channels.setdefault(ch, []).append(col); break
+        for _col in df.columns:
+            if _col == "p_date": continue
+            for _pfx, _ch in _CH_PREFIXES:
+                if _col.startswith(_pfx):
+                    channels.setdefault(_ch, []).append(_col); break
+
+        avail_chs = [ch for ch in CH_ORDER if ch in channels]
 
         def add_treatment(fig):
             if t_start is not None:
@@ -3232,370 +3291,459 @@ elif st.session_state.step == 4:
                 fig.add_annotation(x=str(t_start.date()), y=1, yref="paper", text="Campaign start", showarrow=False, yanchor="bottom", font=dict(color=C["purple"],size=10), xshift=5)
             return fig
 
-        # ── DATA QUALITY (period-aware) ────────────────────────────────────────────
-        with st.expander("📋 Data Quality", expanded=False):
-            _sot_sigs = quality_checks(df)
-            _sot_highs = [s for s in _sot_sigs if s["sev"]=="high"]
-            _sot_conv_c = next((c for c in conv_cols_sot if "TikTok" not in c), conv_cols_sot[0] if conv_cols_sot else None)
-            _sot_total = int(df[_sot_conv_c].sum()) if _sot_conv_c and _sot_conv_c in df.columns else 0
-            _sot_dr = f"{df['p_date'].min().strftime('%d %b')}–{df['p_date'].max().strftime('%d %b %Y')}"
-            st.markdown(
-                f'<div class="mrow">'
-                f'{mtile("Date Range", _sot_dr)}'
-                f'{mtile("Days", str(len(df)), "mvc" if len(df)>=60 else "mva" if len(df)>=40 else "mvr")}'
-                f'{mtile("Issues", str(len(_sot_highs)), "mvr" if _sot_highs else "mvc")}'
-                f'</div>', unsafe_allow_html=True)
-            for _sq in _sot_sigs:
-                _cls = {"high":"card-r","medium":"card-a","low":"card-g"}.get(_sq["sev"],"card-g")
-                _pc = {"high":"pill-r","medium":"pill-a","low":"pill-g"}.get(_sq["sev"],"pill-g")
-                st.markdown(f'<div class="card {_cls}">{pill(_sq["sev"].upper(),_pc)} <strong style="margin-left:8px">{_sq["msg"]}</strong><div style="font-size:12px;color:{C["grey"]};margin-top:5px">{_sq.get("detail","")}</div></div>', unsafe_allow_html=True)
-            if not _sot_sigs:
-                st.markdown(f'<div class="card card-c">✓ No issues detected — data looks clean.</div>', unsafe_allow_html=True)
-            # Calendar gaps
-            _sot_full = pd.date_range(df["p_date"].min(), df["p_date"].max(), freq="D")
-            _sot_gaps = [d for d in _sot_full if d not in df["p_date"].values]
-            if _sot_gaps:
-                st.markdown(f'<div class="card card-r">{pill("GAPS","pill-r")} {len(_sot_gaps)} missing date(s): {", ".join(d.strftime("%d %b") for d in _sot_gaps[:8])}</div>', unsafe_allow_html=True)
-            # Pre:post ratio
+        # ── CONV col for quality checks ────────────────────────────────────────
+        conv_c = _tgt_e if _tgt_e in df.columns else (conv_cols_sot[0] if conv_cols_sot else None)
+
+        # ── 4 TABS ─────────────────────────────────────────────────────────────
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📈 Channels", "🔗 Covariate Checks", "🚩 Flags"])
+
+        # ── TAB 1: OVERVIEW ────────────────────────────────────────────────────
+        with tab1:
+            # Target time series with pre/post shading + confirmed flags
+            _fig_ov1 = go.Figure()
+            if conv_c and conv_c in df.columns:
+                _fig_ov1.add_trace(go.Scatter(
+                    x=df["p_date"], y=df[conv_c], mode="lines",
+                    line=dict(color=C["purple"], width=2), name=conv_c.replace("_"," ")))
             if t_start is not None and t_end is not None:
-                _sot_pre_n = len(df[df["p_date"] < t_start])
-                _sot_post_n = len(df[(df["p_date"] >= t_start) & (df["p_date"] <= t_end)])
-                if _sot_post_n > 0:
-                    _sot_rat = _sot_pre_n / _sot_post_n
-                    _sot_cls = "card-c" if _sot_rat >= 2 else "card-a" if _sot_rat >= 1.5 else "card-r"
-                    st.markdown(f'<div class="card {_sot_cls}" style="margin-top:8px"><strong>Pre/post ratio: {_sot_rat:.1f}×</strong> ({_sot_pre_n} pre · {_sot_post_n} post days)</div>', unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
+                if pre_df is not None and len(pre_df):
+                    _fig_ov1.add_vrect(x0=str(pre_df["p_date"].min().date()), x1=str(t_start.date()),
+                        fillcolor="rgba(123,127,255,0.10)", line_width=0, annotation_text="Pre", annotation_position="top left",
+                        annotation_font=dict(color=C["purple_l"],size=10))
+                _fig_ov1.add_vrect(x0=str(t_start.date()), x1=str(t_end.date()),
+                    fillcolor="rgba(64,200,122,0.10)", line_width=0, annotation_text="Post", annotation_position="top left",
+                    annotation_font=dict(color=C["green"],size=10))
+                _fig_ov1.add_shape(type="line", x0=str(t_start.date()), x1=str(t_start.date()), y0=0, y1=1, yref="paper",
+                    line=dict(color=C["purple"],width=2,dash="dash"))
+            _confirmed_ov1 = [f for f in st.session_state.flag_vars if f.get("confirmed")]
+            for _fv1 in _confirmed_ov1:
+                _fc1 = C["amber"]
+                _fig_ov1.add_vrect(x0=_fv1["start"], x1=_fv1["end"], fillcolor=_fc1, opacity=0.08,
+                    annotation_text=_fv1["name"], annotation_font=dict(color=_fc1,size=9))
+            _fig_ov1.update_layout(**CHART, title=dict(text=f"{conv_c.replace('_',' ') if conv_c else 'Target'} — full series", font=dict(size=14)))
+            st.plotly_chart(_fig_ov1, use_container_width=True)
 
-        # ── CHANNEL SNAPSHOT ───────────────────────────────────────────────────────
-        st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin-bottom:8px">CHANNEL SNAPSHOT — Pre vs Post Lift</div>', unsafe_allow_html=True)
-        _snap_channels = parse_sot_columns(df)
-        _snap_pre  = df[df["p_date"] < t_start]  if t_start is not None else df
-        _snap_post = df[(df["p_date"] >= t_start) & (df["p_date"] <= t_end)] if t_start is not None else pd.DataFrame()
-        _snap_cards = []
-        for _ch_k, _ch_cols in _snap_channels.items():
-            if _ch_k == "Other": continue
-            for _col in _ch_cols:
-                if not any(k in _col for k in ["Conversions","Sessions","Revenue"]): continue
-                _pre_avg  = _snap_pre[_col].mean()  if _col in _snap_pre.columns  and len(_snap_pre)  else 0
-                _post_avg = _snap_post[_col].mean() if _col in _snap_post.columns and len(_snap_post) else 0
-                _lift_s   = (_post_avg - _pre_avg) / _pre_avg * 100 if _pre_avg else 0
-                _lbl      = _col.replace("Paid_Social_TikTok_","TikTok ").replace("Paid_Social_Meta_","Meta ").replace("Paid_Search_Google_","Google ").replace("Organic_Search_","Organic ").replace("Direct_","Direct ").replace("_"," ")
-                _snap_cards.append((_lbl, _pre_avg, _post_avg, _lift_s, "Paid_Social_TikTok" in _col))
-        if _snap_cards:
-            _sn_cols = st.columns(min(len(_snap_cards), 4))
-            for _si, (_lbl, _pa, _pb, _lft, _is_tt) in enumerate(_snap_cards):
-                with _sn_cols[_si % 4]:
-                    _lc = C["purple"] if _lft > 0 else C["red"]
-                    _border_c = "#00D8FF" if _is_tt else C["border"]
-                    _sign = "+" if _lft >= 0 else ""
-                    st.markdown(
-                        f'<div style="border:1px solid {_border_c};border-radius:8px;padding:10px 14px;margin-bottom:10px">'
-                        f'<div style="font-size:10px;color:{C["grey"]};margin-bottom:3px">{_lbl}</div>'
-                        f'<div style="font-size:18px;font-weight:700;color:{_lc}">{_sign}{_lft:.1f}%</div>'
-                        f'<div style="font-size:11px;color:{C["grey"]};margin-top:2px">{_pa:,.0f} → {_pb:,.0f} avg/day</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-        st.markdown("<br>", unsafe_allow_html=True)
+            # Pre/post summary tiles
+            if len(pre_df) and len(post_df) and conv_c and conv_c in df.columns:
+                _pm = pre_df[conv_c].mean(); _qm = post_df[conv_c].mean()
+                _pct = (_qm - _pm) / _pm * 100 if _pm else 0
+                _mc_pct = "mvc" if _pct > 0 else "mvr"
+                st.markdown(
+                    f'<div class="mrow">'
+                    f'{mtile("Pre avg/day", f"{_pm:,.0f}")}'
+                    f'{mtile("Post avg/day", f"{_qm:,.0f}")}'
+                    f'{mtile("Raw change", f"{_pct:+.1f}%", _mc_pct)}'
+                    f'{mtile("Pre days", str(len(pre_df)))}'
+                    f'{mtile("Post days", str(len(post_df)))}'
+                    f'</div>', unsafe_allow_html=True)
 
-        # ── CONSOLIDATED DATA OVERVIEW ─────────────────────────────────────────────
-        st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin-bottom:10px">DATA OVERVIEW</div>', unsafe_allow_html=True)
+            # Quality pills (compact, non-blocking)
+            _q_sigs = quality_checks(df)
+            if _q_sigs:
+                _pill_html = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">'
+                for _qs in _q_sigs:
+                    _qc = {"high":C["red"],"medium":C["amber"],"low":C["green"]}.get(_qs["sev"],C["grey"])
+                    _pill_html += f'<span style="background:{_qc}18;border:1px solid {_qc}40;border-radius:20px;padding:3px 10px;font-size:11px;color:{_qc}">{_qs["msg"]}</span>'
+                st.markdown(_pill_html + "</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div style="font-size:12px;color:{C["green"]};margin-top:10px">✓ No data quality issues detected</div>', unsafe_allow_html=True)
 
-        ov_c1, ov_c2, ov_c3 = st.columns([2, 3, 1])
-        with ov_c1:
-            ov_metric = st.selectbox("Metric", ["Conversions","Sessions","Revenue"], key="ov_metric")
-        with ov_c2:
-            avail_chs = [ch for ch in CH_ORDER if ch in channels]
-            ov_channels = st.multiselect("Channels", options=avail_chs, default=avail_chs, key="ov_channels")
-        with ov_c3:
-            ov_smooth = st.selectbox("Smooth", [1,3,7,14], index=2, key="ov_smooth")
-
-        ov_view = st.radio("View", ["Time Series","Conversion Rate","Pre vs Post","Channel Mix","Lift Overview"], horizontal=True, key="ov_view")
-
-        # Period reminder strip
-        _pre_s_eda  = st.session_state.pre_start
-        _pre_e_eda  = st.session_state.pre_end
-        _post_s_eda = st.session_state.post_start
-        _post_e_eda = st.session_state.post_end
-        if _pre_s_eda and _pre_e_eda and _post_s_eda and _post_e_eda:
-            st.markdown(
-                f'<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap">'
-                f'<span style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em">PERIODS</span>'
-                f'<span style="background:{C["purple"]}25;border:1px solid {C["purple"]}50;border-radius:6px;padding:2px 10px;font-size:11px;color:{C["purple_l"]}">'
-                f'Pre&nbsp;&nbsp;{_pre_s_eda.strftime("%d %b %Y")} – {_pre_e_eda.strftime("%d %b %Y")}</span>'
-                f'<span style="background:{C["green"]}18;border:1px solid {C["green"]}40;border-radius:6px;padding:2px 10px;font-size:11px;color:{C["green"]}">'
-                f'Post&nbsp;&nbsp;{_post_s_eda.strftime("%d %b %Y")} – {_post_e_eda.strftime("%d %b %Y")}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-        col_lookup_ov = {"Conversions": conv_cols_sot, "Sessions": sess_cols_sot, "Revenue": rev_cols_sot}
-        fig_ov = go.Figure()
-        cvr_rows_ov = []
-
-        if ov_view == "Time Series":
-            for ch in ov_channels:
-                col_list = col_lookup_ov.get(ov_metric, [])
-                col = next((c for c in col_list if c.startswith(ch)), None)
-                if col and col in df.columns:
-                    series = df[col].rolling(ov_smooth, center=True, min_periods=1).mean()
-                    nm = ch_lbl(ch) + (f" ({ov_smooth}d avg)" if ov_smooth > 1 else "")
-                    fig_ov.add_trace(go.Scatter(x=df["p_date"], y=series, mode="lines",
-                        line=dict(color=ch_col(ch), width=2.5), name=nm))
-            fig_ov.update_layout(**CHART, title=dict(text=f"{ov_metric} by Channel", font=dict(size=14)))
-            add_treatment(fig_ov)
-
-        elif ov_view == "Conversion Rate":
-            for ch in ov_channels:
-                if ch not in channels: continue
-                s_col = next((c for c in channels[ch] if "Sessions" in c), None)
-                c_col = next((c for c in channels[ch] if "Conversions" in c), None)
-                if not s_col or not c_col: continue
-                cvr = (df[c_col] / df[s_col].replace(0, np.nan) * 100).rolling(ov_smooth, center=True, min_periods=1).mean()
-                fig_ov.add_trace(go.Scatter(x=df["p_date"], y=cvr, mode="lines",
-                    line=dict(color=ch_col(ch), width=2.5), name=ch_lbl(ch)))
-                pre_cvr  = pre_df[c_col].sum() / pre_df[s_col].sum()  * 100 if len(pre_df)  and pre_df[s_col].sum()  > 0 else 0
-                post_cvr = post_df[c_col].sum() / post_df[s_col].sum() * 100 if len(post_df) and post_df[s_col].sum() > 0 else 0
-                delta = (post_cvr - pre_cvr) / pre_cvr * 100 if pre_cvr else 0
-                cvr_rows_ov.append(dict(ch=ch_lbl(ch), pre=pre_cvr, post=post_cvr, delta=delta, color=ch_col(ch)))
-            fig_ov.update_layout(**CHART, title=dict(text=f"Conversion Rate (%) — {ov_smooth}d smoothed", font=dict(size=14)))
-            add_treatment(fig_ov)
-
-        elif ov_view == "Pre vs Post":
-            pv_ov, ptv_ov, lbs_ov = [], [], []
-            for ch in ov_channels:
-                col_list = col_lookup_ov.get(ov_metric, [])
-                col = next((c for c in col_list if c.startswith(ch)), None)
-                if col and col in df.columns:
-                    pv_ov.append(pre_df[col].mean() if len(pre_df) else 0)
-                    ptv_ov.append(post_df[col].mean() if len(post_df) else 0)
-                    lbs_ov.append(ch_lbl(ch))
-            fig_ov.add_trace(go.Bar(name="Pre-Period", x=lbs_ov, y=pv_ov,
-                                    marker_color=C["grey_l"], opacity=0.75))
-            fig_ov.add_trace(go.Bar(name="Post-Period", x=lbs_ov, y=ptv_ov,
-                                    marker_color=C["purple"]))
-            fig_ov.update_layout(**CHART, barmode="group",
-                                  title=dict(text=f"Daily Avg {ov_metric} — Pre vs Post", font=dict(size=14)))
-
-        elif ov_view == "Channel Mix":
-            # Weekly stacked bar — conversions by channel (easier to read than daily)
-            df_w = df.copy()
-            df_w["week"] = df_w["p_date"].dt.to_period("W").apply(lambda r: r.start_time)
-            df_grp = df_w.groupby("week").sum(numeric_only=True).reset_index()
-            df_grp.rename(columns={"week": "p_date"}, inplace=True)
-            col_lookup_ov2 = {"Conversions": conv_cols_sot, "Sessions": sess_cols_sot, "Revenue": rev_cols_sot}
-            for ch in ov_channels:
-                col_list = col_lookup_ov2.get(ov_metric, [])
-                col = next((c for c in col_list if c.startswith(ch)), None)
-                if col and col in df_grp.columns:
-                    fig_ov.add_trace(go.Bar(
-                        x=df_grp["p_date"], y=df_grp[col],
-                        name=ch_lbl(ch), marker_color=ch_col(ch),
-                        hovertemplate="%{x|%d %b}: %{y:,.0f}<extra></extra>",
-                    ))
-            if t_start is not None:
-                fig_ov.add_vline(x=pd.Timestamp(t_start).value // 10**6,
-                    line=dict(color=C["purple_l"], width=2, dash="dash"),
-                    annotation_text="Campaign start",
-                    annotation_position="top right",
-                    annotation_font=dict(color=C["purple_l"], size=10))
-            fig_ov.update_layout(**CHART, barmode="stack", bargap=0.1,
-                title=dict(text=f"Weekly {ov_metric} by Channel (Stacked)", font=dict(size=14)))
-
-        elif ov_view == "Lift Overview":
-            # Horizontal bar — daily avg lift per channel, % labelled — slide-ready
-            lift_rows = []
-            col_lookup_ov3 = {"Conversions": conv_cols_sot, "Sessions": sess_cols_sot, "Revenue": rev_cols_sot}
-            for ch in ov_channels:
-                col_list = col_lookup_ov3.get(ov_metric, [])
-                col = next((c for c in col_list if c.startswith(ch)), None)
-                if col and col in df.columns and len(pre_df) and len(post_df):
-                    pre_avg  = pre_df[col].mean()
-                    post_avg = post_df[col].mean()
-                    abs_lift = post_avg - pre_avg
-                    pct_lift = abs_lift / pre_avg * 100 if pre_avg else 0
-                    lift_rows.append({"ch": ch_lbl(ch), "abs": abs_lift, "pct": pct_lift,
-                                      "pre": pre_avg, "post": post_avg, "color": ch_col(ch)})
-            if lift_rows:
-                lift_rows.sort(key=lambda x: x["abs"])
-                _max_abs = max(abs(r["abs"]) for r in lift_rows) if lift_rows else 1
-                _min_val = min(r["abs"] for r in lift_rows) if lift_rows else 0
-                fig_ov.add_trace(go.Bar(
-                    y=[r["ch"] for r in lift_rows],
-                    x=[r["abs"] for r in lift_rows],
-                    orientation="h",
-                    marker_color=[C["green"] if r["abs"] >= 0 else C["red"] for r in lift_rows],
-                    text=[f"{r['pct']:+.1f}%  ({r['pre']:,.0f} → {r['post']:,.0f})" if r["abs"] >= 0 else "" for r in lift_rows],
-                    textposition="outside",
-                    textfont=dict(color=C["text"], size=11),
-                    cliponaxis=False,
-                ))
-                for _nr in lift_rows:
-                    if _nr["abs"] < 0:
-                        fig_ov.add_annotation(
-                            x=_max_abs * 0.02, y=_nr["ch"],
-                            text=f"{_nr['pct']:+.1f}%  ({_nr['pre']:,.0f} → {_nr['post']:,.0f})",
-                            showarrow=False, xanchor="left", yanchor="middle",
-                            font=dict(size=11, color=C["text"], family="Inter"),
-                        )
-                fig_ov.add_vline(x=0, line=dict(color=C["border"], width=1))
-                fig_ov.update_layout(**CHART,
-                    title=dict(text=f"Daily Avg {ov_metric} — Pre vs Post Lift", font=dict(size=14)),
-                    xaxis_title="Daily average change",
-                    height=max(300, len(lift_rows) * 65),
-                )
-                _left_pad = min(_min_val * 1.8, -_max_abs * 0.05) if _min_val < 0 else -_max_abs * 0.02
-                fig_ov.update_layout(
-                    xaxis_range=[_left_pad, _max_abs * 1.1],
-                    margin=dict(l=160, r=240, t=45, b=45),
-                )
-
-        st.plotly_chart(fig_ov, use_container_width=True)
-
-        # CVR delta tiles (visible only in CVR mode)
-        if ov_view == "Conversion Rate" and cvr_rows_ov:
-            html_cvr = '<div class="mrow">'
-            for r in sorted(cvr_rows_ov, key=lambda x: -abs(x["delta"])):
-                sign = "+"; mc = "mvc"
-                if r["delta"] < 0: sign = ""; mc = "mvr"
-                html_cvr += (f'<div class="mtile" style="border-left:3px solid {r["color"]}">'
-                             f'<div class="ml">{r["ch"]}</div>'
-                             f'<div class="mv {mc}">{sign}{r["delta"]:.1f}%</div>'
-                             f'<div style="font-size:11px;color:{C["grey"]}">{r["pre"]:.2f}% → {r["post"]:.2f}%</div></div>')
-            st.markdown(html_cvr + "</div>", unsafe_allow_html=True)
-
-        # Pre-period stability row (always visible below the chart)
-        col_lookup_flat = col_lookup_ov.get(ov_metric, [])
-        stab_entries = []
-        for ch in (ov_channels or avail_chs):
-            col_s = next((c for c in col_lookup_flat if c.startswith(ch)), None)
-            if col_s and col_s in pre_df.columns:
-                ps = pre_df[col_s].dropna()
-                if len(ps) < 3: continue
-                cv = ps.std() / ps.mean() * 100 if ps.mean() != 0 else 0
-                slope = np.polyfit(np.arange(len(ps)), ps.values, 1)[0] / ps.mean() * 100 if ps.mean() != 0 else 0
-                mc = "mvc" if cv < 20 else "mva" if cv < 40 else "mvr"
-                stab_entries.append((ch, cv, slope, mc))
-        if stab_entries:
-            st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin:10px 0 6px">PRE-PERIOD STABILITY</div>', unsafe_allow_html=True)
-            html_stab = '<div class="mrow">'
-            for ch_s, cv_s, slope_s, mc_s in stab_entries:
-                html_stab += (f'<div class="mtile" style="border-left:3px solid {ch_col(ch_s)}">'
-                              f'<div class="ml">{ch_lbl(ch_s)}</div>'
-                              f'<div class="mv {mc_s}">{cv_s:.0f}% CV</div>'
-                              f'<div style="font-size:11px;color:{C["grey"]}">{slope_s:+.1f}%/day</div></div>')
-            st.markdown(html_stab + "</div>", unsafe_allow_html=True)
-
-        # ── GOOGLE TRENDS OVERLAY ──────────────────────────────────────────────────
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(f'<div style="height:1px;background:{C["border"]};margin:0 0 20px"></div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin-bottom:4px">🔍 Google Search Trends Overlay</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:12px">Overlay category and brand search volume to contextualise whether organic/direct channel lifts were driven by TikTok or external demand. Relative index (0–100) — useful for narrative, not model input.</div>', unsafe_allow_html=True)
-
-        gt_c1, gt_c2, gt_c3, gt_c4 = st.columns([3, 3, 2, 1])
-        with gt_c1:
-            gt_brand = st.text_input("Brand keyword", placeholder="e.g. Chemist Warehouse", key="gt_brand")
-        with gt_c2:
-            gt_category = st.text_input("Category keyword", placeholder="e.g. pharmacy online", key="gt_cat")
-        with gt_c3:
-            gt_geo = st.selectbox("Market", list(GEO_OPTIONS.keys()), index=0, key="gt_geo")
-        with gt_c4:
+        # ── TAB 2: CHANNELS ────────────────────────────────────────────────────
+        with tab2:
+            # Channel snapshot cards
+            _snap_channels = parse_sot_columns(df)
+            _snap_cards = []
+            for _ch_k, _ch_cols in _snap_channels.items():
+                if _ch_k == "Other": continue
+                for _col in _ch_cols:
+                    if not any(k in _col.lower() for k in ["conversions","sessions","revenue"]): continue
+                    _pre_avg  = pre_df[_col].mean()  if _col in pre_df.columns  and len(pre_df)  else 0
+                    _post_avg = post_df[_col].mean() if _col in post_df.columns and len(post_df) else 0
+                    _lift_s   = (_post_avg - _pre_avg) / _pre_avg * 100 if _pre_avg else 0
+                    _lbl = _col.replace("Paid_Social_TikTok_","TikTok ").replace("Paid_Social_Meta_","Meta ").replace("Paid_Search_Google_","Google ").replace("Organic_Search_","Organic ").replace("Direct_","Direct ").replace("_"," ")
+                    _snap_cards.append((_lbl, _pre_avg, _post_avg, _lift_s, "tiktok" in _col.lower()))
+            if _snap_cards:
+                st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin-bottom:8px">CHANNEL SNAPSHOT — Pre vs Post Lift</div>', unsafe_allow_html=True)
+                _sn_cols = st.columns(min(len(_snap_cards), 4))
+                for _si, (_lbl, _pa, _pb, _lft, _is_tt) in enumerate(_snap_cards):
+                    with _sn_cols[_si % 4]:
+                        _lc = C["purple"] if _lft > 0 else C["red"]
+                        _border_c = "#00D8FF" if _is_tt else C["border"]
+                        _sign = "+" if _lft >= 0 else ""
+                        st.markdown(
+                            f'<div style="border:1px solid {_border_c};border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                            f'<div style="font-size:10px;color:{C["grey"]};margin-bottom:3px">{_lbl}</div>'
+                            f'<div style="font-size:18px;font-weight:700;color:{_lc}">{_sign}{_lft:.1f}%</div>'
+                            f'<div style="font-size:11px;color:{C["grey"]};margin-top:2px">{_pa:,.0f} → {_pb:,.0f} avg/day</div>'
+                            f'</div>', unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
-            gt_run = st.button("Fetch Trends", use_container_width=True, key="gt_run")
 
-        if gt_run and (gt_brand or gt_category):
-            keywords_to_fetch = [k for k in [gt_brand, gt_category] if k.strip()]
-            with st.spinner(f"Fetching Google Trends data ({gt_geo})..."):
-                t_range_start = df["p_date"].min().date()
-                t_range_end   = df["p_date"].max().date()
-                df_trends, gt_err = fetch_google_trends(keywords_to_fetch, t_range_start, t_range_end, gt_geo)
-            if gt_err:
-                st.markdown(f'<div class="card card-a">Google Trends error: {gt_err}</div>', unsafe_allow_html=True)
-            elif df_trends is not None:
-                st.session_state.gt_data = df_trends
-                st.session_state.gt_keywords = keywords_to_fetch
+            # Data overview selectors
+            st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin-bottom:10px">DATA OVERVIEW</div>', unsafe_allow_html=True)
+            ov_c1, ov_c2, ov_c3 = st.columns([2, 3, 1])
+            with ov_c1: ov_metric   = st.selectbox("Metric", ["Conversions","Sessions","Revenue"], key="ov_metric")
+            with ov_c2: ov_channels = st.multiselect("Channels", options=avail_chs, default=avail_chs, key="ov_channels")
+            with ov_c3: ov_smooth   = st.selectbox("Smooth", [1,3,7,14], index=2, key="ov_smooth")
+            ov_view = st.radio("View", ["Time Series","Conversion Rate","Pre vs Post","Channel Mix","Lift Overview"], horizontal=True, key="ov_view")
 
-        if st.session_state.get("gt_data") is not None:
-            df_gt = st.session_state.gt_data
-            gt_kws = st.session_state.get("gt_keywords", [])
+            col_lookup_ov = {"Conversions": conv_cols_sot, "Sessions": sess_cols_sot, "Revenue": rev_cols_sot}
+            fig_ov = go.Figure()
+            cvr_rows_ov = []
 
-            # Choose which channel to overlay against
-            overlay_col = next((c for c in conv_cols_sot if "TikTok" in c or "Direct" in c or "Organic" in c), conv_cols_sot[0] if conv_cols_sot else None)
-            overlay_options = conv_cols_sot + sess_cols_sot
-            gt_overlay_col = st.selectbox("Overlay channel metric", overlay_options, key="gt_overlay")
+            if ov_view == "Time Series":
+                for ch in ov_channels:
+                    col = next((c for c in channels.get(ch,[]) if ov_metric.lower() in c.lower()), None)
+                    if col and col in df.columns:
+                        series = df[col].rolling(ov_smooth, center=True, min_periods=1).mean()
+                        fig_ov.add_trace(go.Scatter(x=df["p_date"], y=series, mode="lines",
+                            line=dict(color=ch_col(ch), width=2.5), name=ch_lbl(ch) + (f" ({ov_smooth}d avg)" if ov_smooth > 1 else "")))
+                fig_ov.update_layout(**CHART, title=dict(text=f"{ov_metric} by Channel", font=dict(size=14)))
+                add_treatment(fig_ov)
 
-            fig_gt = go.Figure()
-            # Primary channel on left axis
-            if gt_overlay_col and gt_overlay_col in df.columns:
-                s7 = df[gt_overlay_col].rolling(7, center=True, min_periods=1).mean()
-                fig_gt.add_trace(go.Scatter(
-                    x=df["p_date"], y=s7, mode="lines",
-                    name=gt_overlay_col.replace("_"," ") + " (7d avg)",
-                    line=dict(color=C["purple"], width=2.5), yaxis="y1"
-                ))
-            # Trends on right axis
-            TREND_COLORS = ["#EA4335","#34A853","#FBBC05","#4285F4"]
-            for i, kw in enumerate(gt_kws):
-                if kw in df_gt.columns:
-                    # Resample trends to daily (it comes weekly from pytrends)
-                    trend_daily = df_gt[kw].reindex(pd.date_range(df_gt.index.min(), df_gt.index.max(), freq="D")).interpolate()
-                    fig_gt.add_trace(go.Scatter(
-                        x=trend_daily.index, y=trend_daily.values,
-                        mode="lines", name=f"Search: {kw}",
-                        line=dict(color=TREND_COLORS[i % len(TREND_COLORS)], width=2, dash="dot"),
-                        yaxis="y2", opacity=0.8
-                    ))
-            add_treatment(fig_gt)
-            _gt_layout = {k: v for k, v in CHART.items() if k not in ("yaxis","yaxis2","legend")}
-            fig_gt.update_layout(
-                **_gt_layout,
-                title=dict(text=f"Channel Metric vs Google Search Interest ({gt_geo})", font=dict(size=14)),
-                yaxis=dict(title="Channel metric", gridcolor="#E5E7EB", showgrid=True),
-                yaxis2=dict(title="Search interest (0–100)", overlaying="y", side="right",
-                            showgrid=False, range=[0, 110],
-                            tickfont=dict(color=C["grey"], size=10)),
-                legend=dict(orientation="h", y=-0.2)
-            )
-            st.plotly_chart(fig_gt, use_container_width=True)
+            elif ov_view == "Conversion Rate":
+                for ch in ov_channels:
+                    s_col = next((c for c in channels.get(ch,[]) if "session" in c.lower()), None)
+                    c_col = next((c for c in channels.get(ch,[]) if "conversion" in c.lower()), None)
+                    if not s_col or not c_col: continue
+                    cvr = (df[c_col] / df[s_col].replace(0, np.nan) * 100).rolling(ov_smooth, center=True, min_periods=1).mean()
+                    fig_ov.add_trace(go.Scatter(x=df["p_date"], y=cvr, mode="lines",
+                        line=dict(color=ch_col(ch), width=2.5), name=ch_lbl(ch)))
+                    pre_cvr  = pre_df[c_col].sum()  / pre_df[s_col].sum()  * 100 if len(pre_df)  and pre_df[s_col].sum()  > 0 else 0
+                    post_cvr = post_df[c_col].sum() / post_df[s_col].sum() * 100 if len(post_df) and post_df[s_col].sum() > 0 else 0
+                    delta = (post_cvr - pre_cvr) / pre_cvr * 100 if pre_cvr else 0
+                    cvr_rows_ov.append(dict(ch=ch_lbl(ch), pre=pre_cvr, post=post_cvr, delta=delta, color=ch_col(ch)))
+                fig_ov.update_layout(**CHART, title=dict(text=f"Conversion Rate (%) — {ov_smooth}d smoothed", font=dict(size=14)))
+                add_treatment(fig_ov)
 
-            # Correlation between trends and channel
-            if gt_overlay_col and gt_overlay_col in df.columns:
-                corr_rows = []
-                for kw in gt_kws:
-                    if kw in df_gt.columns:
-                        trend_daily = df_gt[kw].reindex(pd.date_range(df_gt.index.min(), df_gt.index.max(), freq="D")).interpolate()
-                        merged = pd.merge(
-                            df[["p_date", gt_overlay_col]].rename(columns={"p_date":"date"}),
-                            trend_daily.rename("trend").reset_index().rename(columns={"index":"date"}),
-                            on="date", how="inner"
-                        )
-                        if len(merged) > 5:
-                            r = merged[gt_overlay_col].corr(merged["trend"])
-                            corr_rows.append((kw, r))
-                if corr_rows:
-                    html_corr = '<div class="mrow">'
-                    for kw, r in corr_rows:
-                        mc = "mvc" if abs(r) > 0.6 else "mva" if abs(r) > 0.3 else "mvr"
-                        interp = "Strong" if abs(r) > 0.6 else "Moderate" if abs(r) > 0.3 else "Weak"
-                        direction = "positive" if r > 0 else "negative"
-                        html_corr += (f'<div class="mtile"><div class="ml">"{kw}" vs channel</div>'
-                                      f'<div class="mv {mc}">{r:.2f} R</div>'
-                                      f'<div style="font-size:11px;color:{C["grey"]}">{interp} {direction} correlation</div></div>')
-                    st.markdown(html_corr + "</div>", unsafe_allow_html=True)
-                    # Narrative interpretation
-                    high_corr = [kw for kw, r in corr_rows if abs(r) > 0.5]
-                    low_corr  = [kw for kw, r in corr_rows if abs(r) <= 0.3]
-                    if high_corr:
-                        st.markdown(f'<div class="card card-a">⚠️ <strong>High correlation with {", ".join(high_corr)}</strong> — the channel lift may partly reflect broader search demand rather than TikTok incrementality alone. Flag this when contextualising results.</div>', unsafe_allow_html=True)
-                    elif low_corr:
-                        st.markdown(f'<div class="card card-c">✓ <strong>Low correlation with search trends</strong> — the channel lift is unlikely to be explained by broader category demand. Stronger evidence for TikTok incrementality.</div>', unsafe_allow_html=True)
+            elif ov_view == "Pre vs Post":
+                pv_ov, ptv_ov, lbs_ov = [], [], []
+                for ch in ov_channels:
+                    col = next((c for c in channels.get(ch,[]) if ov_metric.lower() in c.lower()), None)
+                    if col and col in df.columns:
+                        pv_ov.append(pre_df[col].mean() if len(pre_df) else 0)
+                        ptv_ov.append(post_df[col].mean() if len(post_df) else 0)
+                        lbs_ov.append(ch_lbl(ch))
+                fig_ov.add_trace(go.Bar(name="Pre-Period",  x=lbs_ov, y=pv_ov,  marker_color=C["grey_l"], opacity=0.75))
+                fig_ov.add_trace(go.Bar(name="Post-Period", x=lbs_ov, y=ptv_ov, marker_color=C["purple"]))
+                fig_ov.update_layout(**CHART, barmode="group", title=dict(text=f"Daily Avg {ov_metric} — Pre vs Post", font=dict(size=14)))
+
+            elif ov_view == "Channel Mix":
+                df_w = df.copy()
+                df_w["week"] = df_w["p_date"].dt.to_period("W").apply(lambda r: r.start_time)
+                df_grp = df_w.groupby("week").sum(numeric_only=True).reset_index().rename(columns={"week":"p_date"})
+                for ch in ov_channels:
+                    col = next((c for c in channels.get(ch,[]) if ov_metric.lower() in c.lower()), None)
+                    if col and col in df_grp.columns:
+                        fig_ov.add_trace(go.Bar(x=df_grp["p_date"], y=df_grp[col], name=ch_lbl(ch),
+                            marker_color=ch_col(ch), hovertemplate="%{x|%d %b}: %{y:,.0f}<extra></extra>"))
+                if t_start is not None:
+                    fig_ov.add_vline(x=pd.Timestamp(t_start).value // 10**6,
+                        line=dict(color=C["purple_l"],width=2,dash="dash"),
+                        annotation_text="Campaign start", annotation_position="top right",
+                        annotation_font=dict(color=C["purple_l"],size=10))
+                fig_ov.update_layout(**CHART, barmode="stack", bargap=0.1,
+                    title=dict(text=f"Weekly {ov_metric} by Channel (Stacked)", font=dict(size=14)))
+
+            elif ov_view == "Lift Overview":
+                lift_rows = []
+                for ch in ov_channels:
+                    col = next((c for c in channels.get(ch,[]) if ov_metric.lower() in c.lower()), None)
+                    if col and col in df.columns and len(pre_df) and len(post_df):
+                        pre_avg  = pre_df[col].mean(); post_avg = post_df[col].mean()
+                        abs_lift = post_avg - pre_avg
+                        pct_lift = abs_lift / pre_avg * 100 if pre_avg else 0
+                        lift_rows.append({"ch":ch_lbl(ch),"abs":abs_lift,"pct":pct_lift,"pre":pre_avg,"post":post_avg,"color":ch_col(ch)})
+                if lift_rows:
+                    lift_rows.sort(key=lambda x: x["abs"])
+                    _max_abs = max(abs(r["abs"]) for r in lift_rows); _min_val = min(r["abs"] for r in lift_rows)
+                    fig_ov.add_trace(go.Bar(y=[r["ch"] for r in lift_rows], x=[r["abs"] for r in lift_rows], orientation="h",
+                        marker_color=[C["green"] if r["abs"] >= 0 else C["red"] for r in lift_rows],
+                        text=[f"{r['pct']:+.1f}%  ({r['pre']:,.0f} → {r['post']:,.0f})" if r["abs"] >= 0 else "" for r in lift_rows],
+                        textposition="outside", textfont=dict(color=C["text"],size=11), cliponaxis=False))
+                    for _nr in lift_rows:
+                        if _nr["abs"] < 0:
+                            fig_ov.add_annotation(x=_max_abs*0.02, y=_nr["ch"],
+                                text=f"{_nr['pct']:+.1f}%  ({_nr['pre']:,.0f} → {_nr['post']:,.0f})",
+                                showarrow=False, xanchor="left", yanchor="middle",
+                                font=dict(size=11,color=C["text"],family="Inter"))
+                    fig_ov.add_vline(x=0, line=dict(color=C["border"],width=1))
+                    _left_pad = min(_min_val*1.8,-_max_abs*0.05) if _min_val < 0 else -_max_abs*0.02
+                    fig_ov.update_layout(**CHART,
+                        title=dict(text=f"Daily Avg {ov_metric} — Pre vs Post Lift",font=dict(size=14)),
+                        xaxis_title="Daily average change", height=max(300,len(lift_rows)*65),
+                        xaxis_range=[_left_pad,_max_abs*1.1], margin=dict(l=160,r=240,t=45,b=45))
+
+            st.plotly_chart(fig_ov, use_container_width=True)
+
+            if ov_view == "Conversion Rate" and cvr_rows_ov:
+                html_cvr = '<div class="mrow">'
+                for r in sorted(cvr_rows_ov, key=lambda x: -abs(x["delta"])):
+                    sign = "+"; mc = "mvc"
+                    if r["delta"] < 0: sign = ""; mc = "mvr"
+                    html_cvr += (f'<div class="mtile" style="border-left:3px solid {r["color"]}">'
+                                 f'<div class="ml">{r["ch"]}</div><div class="mv {mc}">{sign}{r["delta"]:.1f}%</div>'
+                                 f'<div style="font-size:11px;color:{C["grey"]}">{r["pre"]:.2f}% → {r["post"]:.2f}%</div></div>')
+                st.markdown(html_cvr + "</div>", unsafe_allow_html=True)
+
+            stab_entries = []
+            for ch in (ov_channels or avail_chs):
+                col_s = next((c for c in channels.get(ch,[]) if ov_metric.lower() in c.lower()), None)
+                if col_s and col_s in pre_df.columns:
+                    ps = pre_df[col_s].dropna()
+                    if len(ps) < 3: continue
+                    cv = ps.std() / ps.mean() * 100 if ps.mean() != 0 else 0
+                    slope = np.polyfit(np.arange(len(ps)), ps.values, 1)[0] / ps.mean() * 100 if ps.mean() != 0 else 0
+                    mc = "mvc" if cv < 20 else "mva" if cv < 40 else "mvr"
+                    stab_entries.append((ch, cv, slope, mc))
+            if stab_entries:
+                st.markdown(f'<div style="font-size:11px;font-weight:600;color:{C["grey"]};letter-spacing:.06em;margin:10px 0 6px">PRE-PERIOD STABILITY</div>', unsafe_allow_html=True)
+                html_stab = '<div class="mrow">'
+                for ch_s, cv_s, slope_s, mc_s in stab_entries:
+                    html_stab += (f'<div class="mtile" style="border-left:3px solid {ch_col(ch_s)}">'
+                                  f'<div class="ml">{ch_lbl(ch_s)}</div><div class="mv {mc_s}">{cv_s:.0f}% CV</div>'
+                                  f'<div style="font-size:11px;color:{C["grey"]}">{slope_s:+.1f}%/day</div></div>')
+                st.markdown(html_stab + "</div>", unsafe_allow_html=True)
+
+            # Google Trends overlay
+            with st.expander("🔍 Google Search Trends Overlay"):
+                st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:12px">Overlay category and brand search volume to contextualise channel lifts. Relative index (0–100).</div>', unsafe_allow_html=True)
+                gt_c1, gt_c2, gt_c3, gt_c4 = st.columns([3, 3, 2, 1])
+                with gt_c1: gt_brand    = st.text_input("Brand keyword",    placeholder="e.g. Babyboo", key="gt_brand")
+                with gt_c2: gt_category = st.text_input("Category keyword", placeholder="e.g. baby fashion", key="gt_cat")
+                with gt_c3: gt_geo      = st.selectbox("Market", list(GEO_OPTIONS.keys()), index=0, key="gt_geo")
+                with gt_c4:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    gt_run = st.button("Fetch Trends", use_container_width=True, key="gt_run")
+                if gt_run and (gt_brand or gt_category):
+                    _kw_list = [k for k in [gt_brand, gt_category] if k.strip()]
+                    with st.spinner(f"Fetching Google Trends ({gt_geo})..."):
+                        _df_tr, _gt_err = fetch_google_trends(_kw_list, df["p_date"].min().date(), df["p_date"].max().date(), gt_geo)
+                    if _gt_err:
+                        st.markdown(f'<div class="card card-a">Google Trends error: {_gt_err}</div>', unsafe_allow_html=True)
+                    elif _df_tr is not None:
+                        st.session_state.gt_data = _df_tr; st.session_state.gt_keywords = _kw_list
+                if st.session_state.get("gt_data") is not None:
+                    df_gt = st.session_state.gt_data; gt_kws = st.session_state.get("gt_keywords",[])
+                    overlay_options = conv_cols_sot + sess_cols_sot
+                    gt_overlay_col = st.selectbox("Overlay channel metric", overlay_options, key="gt_overlay")
+                    fig_gt = go.Figure()
+                    if gt_overlay_col and gt_overlay_col in df.columns:
+                        fig_gt.add_trace(go.Scatter(x=df["p_date"], y=df[gt_overlay_col].rolling(7,center=True,min_periods=1).mean(),
+                            mode="lines", name=gt_overlay_col.replace("_"," ")+" (7d avg)", line=dict(color=C["purple"],width=2.5), yaxis="y1"))
+                    TREND_COLORS = ["#EA4335","#34A853","#FBBC05","#4285F4"]
+                    for i, kw in enumerate(gt_kws):
+                        if kw in df_gt.columns:
+                            td = df_gt[kw].reindex(pd.date_range(df_gt.index.min(), df_gt.index.max(), freq="D")).interpolate()
+                            fig_gt.add_trace(go.Scatter(x=td.index, y=td.values, mode="lines", name=f"Search: {kw}",
+                                line=dict(color=TREND_COLORS[i%len(TREND_COLORS)],width=2,dash="dot"), yaxis="y2", opacity=0.8))
+                    add_treatment(fig_gt)
+                    _gt_layout = {k: v for k, v in CHART.items() if k not in ("yaxis","yaxis2","legend")}
+                    fig_gt.update_layout(**_gt_layout,
+                        title=dict(text=f"Channel Metric vs Google Search Interest ({gt_geo})", font=dict(size=14)),
+                        yaxis=dict(title="Channel metric", gridcolor="#E5E7EB", showgrid=True),
+                        yaxis2=dict(title="Search interest (0–100)", overlaying="y", side="right", showgrid=False, range=[0,110], tickfont=dict(color=C["grey"],size=10)),
+                        legend=dict(orientation="h", y=-0.2))
+                    st.plotly_chart(fig_gt, use_container_width=True)
+                    if gt_overlay_col and gt_overlay_col in df.columns:
+                        corr_rows = []
+                        for kw in gt_kws:
+                            if kw in df_gt.columns:
+                                td = df_gt[kw].reindex(pd.date_range(df_gt.index.min(),df_gt.index.max(),freq="D")).interpolate()
+                                merged = pd.merge(df[["p_date",gt_overlay_col]].rename(columns={"p_date":"date"}),
+                                    td.rename("trend").reset_index().rename(columns={"index":"date"}), on="date", how="inner")
+                                if len(merged) > 5:
+                                    corr_rows.append((kw, merged[gt_overlay_col].corr(merged["trend"])))
+                        if corr_rows:
+                            html_corr = '<div class="mrow">'
+                            for kw, r in corr_rows:
+                                mc = "mvc" if abs(r)>0.6 else "mva" if abs(r)>0.3 else "mvr"
+                                html_corr += f'<div class="mtile"><div class="ml">"{kw}" vs channel</div><div class="mv {mc}">{r:.2f} R</div><div style="font-size:11px;color:{C["grey"]}">{"Strong" if abs(r)>0.6 else "Moderate" if abs(r)>0.3 else "Weak"} {"positive" if r>0 else "negative"}</div></div>'
+                            st.markdown(html_corr + "</div>", unsafe_allow_html=True)
+
+        # ── TAB 3: COVARIATE CHECKS ────────────────────────────────────────────
+        with tab3:
+            tc2, tc3, tc4 = st.tabs(["📈 Weekday Trend", "🔍 Outliers", "🔗 Covariate Validation"])
+
+            with tc2:
+                st.markdown("Weekday cyclicality — does demand vary significantly by day of week in the pre-period?")
+                st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:10px">A strong weekday pattern (>20% deviation from the weekly average) suggests you should add a weekend flag or day-of-week dummy as a covariate so the model does not mistake the pattern for intervention effect.</div>', unsafe_allow_html=True)
+                if conv_c and conv_c in df.columns:
+                    _pre_tc = pre_df.copy() if len(pre_df) else df.copy()
+                    _pre_tc["_dow"] = _pre_tc["p_date"].dt.day_name()
+                    _dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                    _dow_avg = _pre_tc.groupby("_dow")[conv_c].mean().reindex(_dow_order)
+                    _overall = _dow_avg.mean()
+                    _pct_dev = ((_dow_avg - _overall) / _overall * 100).round(1)
+                    _bar_cols = [C["purple"] if abs(v) > 20 else C["grey_l"] for v in _pct_dev]
+                    _fig_dow = go.Figure(go.Bar(x=_dow_order, y=_dow_avg.values, marker_color=_bar_cols,
+                        customdata=_pct_dev.values, hovertemplate="%{x}: %{y:,.0f} avg (%{customdata:+.1f}% vs weekly avg)<extra></extra>"))
+                    _fig_dow.add_hline(y=_overall, line_dash="dot", line_color=C["amber"], annotation_text="Weekly avg")
+                    _fig_dow.update_layout(**CHART, height=260, title=dict(text=f"Avg {conv_c.replace('_',' ')} by weekday (pre-period)", font=dict(size=13)))
+                    st.plotly_chart(_fig_dow, use_container_width=True)
+                    _strong = [d for d, v in _pct_dev.items() if abs(v) > 20]
+                    if _strong:
+                        st.markdown(f'<div class="card card-a">{pill("CYCLICALITY DETECTED","pill-a")} <strong style="margin-left:8px">{", ".join(_strong)}</strong> deviate >20% from weekly avg — consider adding a weekend or day-of-week flag as a covariate.</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<div class="card card-c">✓ No strong weekday cyclicality — no day-of-week flag needed</div>', unsafe_allow_html=True)
+                else:
+                    st.info("No target column detected.")
+
+            with tc3:
+                st.markdown("Outlier detection — three methods to flag abnormal days in the pre-period")
+                st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:10px">Not all flagged days need treatment. If the spike/dip has a clear business explanation keep it as-is and add a dummy flag. Only winsorise if it is unexplained noise.</div>', unsafe_allow_html=True)
+                if conv_c and conv_c in df.columns:
+                    _pre_out = pre_df.copy() if len(pre_df) else df.copy()
+                    _c1, _c2 = st.columns(2)
+                    with _c1: _dod_t = st.slider("Day-over-day threshold (%)", 50, 300, 150, 25, key="dod_t")
+                    with _c2: _z_t   = st.slider("Z-score threshold", 1.5, 4.0, 2.5, 0.5, key="z_t")
+                    _dod_chg = _pre_out[conv_c].pct_change().abs() * 100
+                    _dod_f = _pre_out[_dod_chg > _dod_t]["p_date"].dt.strftime("%d %b").tolist()
+                    _m = _pre_out[conv_c].mean(); _s = _pre_out[conv_c].std()
+                    _z_f = _pre_out[abs((_pre_out[conv_c]-_m)/_s) > _z_t]["p_date"].dt.strftime("%d %b").tolist() if _s > 0 else []
+                    _q1, _q3 = _pre_out[conv_c].quantile(0.25), _pre_out[conv_c].quantile(0.75)
+                    _iqr_f = _pre_out[(_pre_out[conv_c]<_q1-1.5*(_q3-_q1))|(_pre_out[conv_c]>_q3+1.5*(_q3-_q1))]["p_date"].dt.strftime("%d %b").tolist()
+                    _cm1, _cm2, _cm3 = st.columns(3)
+                    with _cm1: st.markdown(f'<div class="card {"card-r" if _dod_f else "card-c"}"><strong>Day-over-day</strong><br><span style="font-size:22px;font-weight:700">{len(_dod_f)}</span> flags<br><div style="font-size:11px;color:{C["grey"]}">{", ".join(_dod_f[:4]) if _dod_f else "None"}</div></div>', unsafe_allow_html=True)
+                    with _cm2: st.markdown(f'<div class="card {"card-r" if _z_f else "card-c"}"><strong>Z-score</strong><br><span style="font-size:22px;font-weight:700">{len(_z_f)}</span> flags<br><div style="font-size:11px;color:{C["grey"]}">{", ".join(_z_f[:4]) if _z_f else "None"}</div></div>', unsafe_allow_html=True)
+                    with _cm3: st.markdown(f'<div class="card {"card-r" if _iqr_f else "card-c"}"><strong>IQR fence</strong><br><span style="font-size:22px;font-weight:700">{len(_iqr_f)}</span> flags<br><div style="font-size:11px;color:{C["grey"]}">{", ".join(_iqr_f[:4]) if _iqr_f else "None"}</div></div>', unsafe_allow_html=True)
+                    _all_f = sorted(set(_dod_f + _z_f + _iqr_f))
+                    if _all_f:
+                        st.markdown(f'<div class="card card-a" style="margin-top:10px"><strong>Flagged pre-period dates:</strong> {", ".join(_all_f)}<div style="font-size:12px;color:{C["grey"]};margin-top:6px">If business-driven: keep and add a flag in the Flags tab. If unexplained noise: winsorise below.</div></div>', unsafe_allow_html=True)
+                        with st.expander("Winsorisation — cap extreme values at 95th percentile"):
+                            _p95 = _pre_out[conv_c].quantile(0.95); _p05 = _pre_out[conv_c].quantile(0.05)
+                            st.markdown(f"Pre-period 5th pct: {_p05:,.0f} · 95th pct: {_p95:,.0f}")
+                            if st.button(f"Winsorise {conv_c} at 95th percentile", key="winsor_btn"):
+                                _df_w = parse_dates(st.session_state.daily_df.copy())
+                                _df_w[conv_c] = _df_w[conv_c].clip(lower=_p05, upper=_p95)
+                                st.session_state.daily_df = _df_w
+                                st.success(f"Winsorised {conv_c}. Values capped between {_p05:,.0f} and {_p95:,.0f}.")
+                                st.rerun()
+                else:
+                    st.info("No target column detected.")
+
+            with tc4:
+                st.markdown("Covariate validation — checks whether your covariates are safe to use as controls")
+                st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:10px">Three checks: (1) Pre/post average change — if a covariate changed >20% after the intervention it may itself have been affected. (2) Extrapolation risk — if post-period values fall outside the pre-period range. (3) Scale — if covariates have very different scales, log-standardisation can help.</div>', unsafe_allow_html=True)
+                if t_start is not None and st.session_state.daily_df is not None:
+                    _df_cv = parse_dates(st.session_state.daily_df.copy())
+                    _cov_list = [c for c in _df_cv.columns if c not in ["p_date","prepost_1","prepost"]
+                                 and _df_cv[c].dtype in ["float64","int64"]
+                                 and not any(k in c.lower() for k in ["cost","topview","flag","spend","pre_period","post_period"])]
+                    if _cov_list:
+                        _pre_cv  = _df_cv[_df_cv["p_date"] < t_start]
+                        _post_cv = _df_cv[(_df_cv["p_date"] >= t_start) & (_df_cv["p_date"] <= t_end)] if t_end else _df_cv[_df_cv["p_date"] >= t_start]
+                        _cv_rows = []
+                        for _c in _cov_list[:15]:
+                            _pa = _pre_cv[_c].mean(); _pb = _post_cv[_c].mean()
+                            if _pa and _pa != 0:
+                                _chg = (_pb - _pa) / abs(_pa) * 100
+                                _p10 = _pre_cv[_c].quantile(0.1); _p90 = _pre_cv[_c].quantile(0.9)
+                                _extrap_pct = ((_post_cv[_c] < _p10).sum() + (_post_cv[_c] > _p90).sum()) / len(_post_cv) * 100 if len(_post_cv) > 0 else 0
+                                _std = _pre_cv[_c].std()
+                                _z_post_max = abs((_post_cv[_c] - _pa) / _std).max() if _std > 0 else 0
+                                _cv_rows.append({
+                                    "Covariate": _c, "Pre avg": f"{_pa:,.0f}", "Post avg": f"{_pb:,.0f}",
+                                    "Δ pre→post": f"{_chg:+.1f}%",
+                                    "Endogeneity": "⚠️ >20%" if abs(_chg) > 20 else "✓",
+                                    "Extrapolation": f"⚠️ {_extrap_pct:.0f}% out of range" if _extrap_pct > 20 else "✓",
+                                    "Max Z-post": f"{'⚠️ ' if _z_post_max > 3 else ''}{_z_post_max:.1f}σ"
+                                })
+                        if _cv_rows:
+                            st.dataframe(pd.DataFrame(_cv_rows), use_container_width=True, hide_index=True)
+                            _risky = [r["Covariate"] for r in _cv_rows if "⚠️" in r["Endogeneity"]]
+                            _extrap_risky = [r["Covariate"] for r in _cv_rows if "⚠️" in r["Extrapolation"]]
+                            if _risky:
+                                st.markdown(f'<div class="card card-a">{pill("ENDOGENEITY RISK","pill-a")} <strong style="margin-left:8px">{", ".join(_risky)}</strong> changed >20% pre→post — may have been affected by the intervention itself.</div>', unsafe_allow_html=True)
+                            if _extrap_risky:
+                                st.markdown(f'<div class="card card-a">{pill("EXTRAPOLATION RISK","pill-a")} <strong style="margin-left:8px">{", ".join(_extrap_risky)}</strong> have post-period values outside the pre-period P10–P90 range.</div>', unsafe_allow_html=True)
+                        with st.expander("Scale adjustment — log transform + standardise"):
+                            st.markdown(f'<div style="font-size:12px;color:{C["grey"]}">Log transformation + z-score standardisation can improve model stability for right-skewed covariates with large absolute values.</div>', unsafe_allow_html=True)
+                            _scale_cols = st.multiselect("Select columns to log-standardise", options=_cov_list, key="scale_cols")
+                            if _scale_cols and st.button("Apply log-standardisation", key="scale_btn"):
+                                _df_sc = parse_dates(st.session_state.daily_df.copy())
+                                for _sc in _scale_cols:
+                                    if (_df_sc[_sc] > 0).all():
+                                        _log_vals = np.log(_df_sc[_sc])
+                                        _df_sc[f"{_sc}_logstd"] = (_log_vals - _log_vals.mean()) / _log_vals.std()
+                                    else:
+                                        st.warning(f"{_sc} has zero/negative values — log transform skipped.")
+                                st.session_state.daily_df = _df_sc
+                                st.success(f"Added log-standardised columns: {', '.join(f'{c}_logstd' for c in _scale_cols)}")
+                                st.rerun()
+                    else:
+                        st.info("No numeric covariate columns detected.")
+                else:
+                    st.info("Set post-period start date to enable covariate validation.")
+
+        # ── TAB 4: FLAGS ───────────────────────────────────────────────────────
+        with tab4:
+            _df_flags = df.copy()
+            if not st.session_state.flag_vars:
+                st.session_state.flag_vars = suggest_flags(_df_flags, synthesis=None)
+            _brief_flags = [f for f in st.session_state.flag_vars if f.get("source") == "brief"]
+            _data_flags  = [f for f in st.session_state.flag_vars if f.get("source") != "brief"]
+            if _brief_flags:
+                st.markdown(f'<div class="t-meta" style="color:{C["purple"]};margin-bottom:10px">✓ {len(_brief_flags)} flag(s) detected from brief · {len(_data_flags)} detected from data</div>', unsafe_allow_html=True)
+            for i, fv in enumerate(st.session_state.flag_vars):
+                style = "card-c" if fv.get("is_treatment") else "card-a"
+                label = "TREATMENT WINDOW" if fv.get("is_treatment") else "COVARIATE FLAG"
+                lp = "pill-c" if fv.get("is_treatment") else "pill-a"
+                src_badge = pill("from brief","pill-c") if fv.get("source")=="brief" else pill("from data","pill-g")
+                st.markdown(f'<div class="card {style}">{pill(label,lp)} {src_badge} <strong style="margin-left:8px;font-size:14px">{fv["name"]}</strong><div class="t-meta" style="margin-top:5px">{fv["rationale"]}</div></div>', unsafe_allow_html=True)
+                cn, cs, ce, cc = st.columns([3, 2, 2, 1])
+                with cn:
+                    st.markdown(f'<div class="t-label" style="margin-bottom:3px">Name</div>', unsafe_allow_html=True)
+                    nn = st.text_input("Name", value=fv["name"], key=f"fn{i}", label_visibility="collapsed")
+                    st.session_state.flag_vars[i]["name"] = nn
+                with cs:
+                    st.markdown(f'<div class="t-label" style="margin-bottom:3px">Start</div>', unsafe_allow_html=True)
+                    ns = st.date_input("Start", value=pd.to_datetime(fv["start"]).date(),
+                        min_value=_df_flags["p_date"].min().date(), max_value=_df_flags["p_date"].max().date(),
+                        key=f"fs{i}", label_visibility="collapsed")
+                    st.session_state.flag_vars[i]["start"] = str(ns)
+                with ce:
+                    st.markdown(f'<div class="t-label" style="margin-bottom:3px">End</div>', unsafe_allow_html=True)
+                    ne = st.date_input("End", value=pd.to_datetime(fv["end"]).date(),
+                        min_value=_df_flags["p_date"].min().date(), max_value=_df_flags["p_date"].max().date(),
+                        key=f"fe{i}", label_visibility="collapsed")
+                    st.session_state.flag_vars[i]["end"] = str(ne)
+                with cc:
+                    st.markdown(f'<div class="t-label" style="margin-bottom:3px">Include</div>', unsafe_allow_html=True)
+                    chk = st.checkbox("Include", value=fv.get("confirmed",False), key=f"fc{i}", label_visibility="collapsed")
+                    st.session_state.flag_vars[i]["confirmed"] = chk
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander("Add custom flag"):
+                xa, xb, xc, xd = st.columns([2,2,2,2])
+                with xa: fn = st.text_input("Flag name", placeholder="e.g. FootyFinals_WarmupFlag")
+                with xb: fs = st.date_input("Start date", min_value=_df_flags["p_date"].min().date(), max_value=_df_flags["p_date"].max().date(), key="nfs")
+                with xc: fe = st.date_input("End date",   min_value=_df_flags["p_date"].min().date(), max_value=_df_flags["p_date"].max().date(), key="nfe")
+                with xd: fr = st.text_input("Rationale", placeholder="Why flag this period?")
+                if st.button("Add flag"):
+                    if fn:
+                        st.session_state.flag_vars.append(dict(name=fn,start=str(fs),end=str(fe),rationale=fr,confirmed=True,is_treatment=False))
+                        st.rerun()
+            _confirmed_flags = [f for f in st.session_state.flag_vars if f.get("confirmed")]
+            if _confirmed_flags:
+                _tgt_flag = st.session_state.target_col or conv_c
+                if _tgt_flag and _tgt_flag in _df_flags.columns:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    fig_fl = go.Figure()
+                    fig_fl.add_trace(go.Scatter(x=_df_flags["p_date"], y=_df_flags[_tgt_flag], mode="lines",
+                        line=dict(color=C["purple"],width=2), name=_tgt_flag.replace("_"," ")))
+                    for fv in _confirmed_flags:
+                        _fc = C["purple"] if fv.get("is_treatment") else C["amber"]
+                        fig_fl.add_vrect(x0=fv["start"],x1=fv["end"],fillcolor=_fc,opacity=0.1,
+                            annotation_text=fv["name"],annotation=dict(font=dict(color=_fc,size=10),yanchor="top"))
+                    fig_fl.update_layout(**CHART, title=dict(text="Confirmed flags on target series",font=dict(size=14)))
+                    st.plotly_chart(fig_fl, use_container_width=True)
 
         # ── NAVIGATION ─────────────────────────────────────────────────────────
-        sot_b1,sot_b2 = st.columns([1,5])
-        with sot_b1:
-            if st.button("Back",key="sot_eda_back"): st.session_state.step=1; st.rerun()
-        with sot_b2:
-            if st.button("Continue to Model →", use_container_width=True, type="primary", key="sot_eda_fwd"):
+        st.markdown("<br>", unsafe_allow_html=True)
+        _exp_b1, _exp_b2 = st.columns([1, 5])
+        with _exp_b1:
+            if st.button("Back", key="exp_back"): st.session_state.step=0; st.rerun()
+        with _exp_b2:
+            if st.button("Continue to Model →", use_container_width=True, type="primary", key="exp_fwd"):
                 st.session_state.step=6; st.session_state.max_step=max(st.session_state.max_step,6); st.rerun()
         st.stop()
 
@@ -4158,7 +4306,7 @@ elif st.session_state.step == 6:
         st.markdown(f'<div style="font-size:12px;color:{C["grey"]};margin-bottom:10px">Confirmed flags are added as binary covariates to the model. Use the full editor via <strong>5 · Model → Flags</strong> in the sidebar.</div>', unsafe_allow_html=True)
         _df_flags = parse_dates(st.session_state.daily_df.copy())
         if not st.session_state.flag_vars:
-            st.session_state.flag_vars = suggest_flags(_df_flags, synthesis=st.session_state.ai_synthesis)
+            st.session_state.flag_vars = suggest_flags(_df_flags, synthesis=None)
         for _fi, _fv in enumerate(st.session_state.flag_vars):
             _fc1, _fc2, _fc3, _fc4 = st.columns([3, 2, 2, 1])
             with _fc1:
@@ -4242,23 +4390,6 @@ elif st.session_state.step == 6:
         _int_label = _hyp_cfg.get("intervention_label", "")
         st.markdown(f'<div class="t-meta" style="margin-bottom:14px">Hypothesis: <strong>{_hyp_name}</strong> · Intervention: {_int_label}</div>', unsafe_allow_html=True)
 
-    # ── Cross-channel confounder warning (from brief synthesis) ───────────────
-    _syn6 = st.session_state.ai_synthesis or {}
-    _ccf6 = _syn6.get("cross_channel_confounders", [])
-    _must_covs = [cf["channel"] for cf in _ccf6 if cf.get("must_include_as_covariate")]
-    if _must_covs:
-        _missing_covs = [ch for ch in _must_covs if not any(ch.lower() in c.lower() for c in num_cols)]
-        _present_covs = [ch for ch in _must_covs if any(ch.lower() in c.lower() for c in num_cols)]
-        _warn_html = "".join(f'<div class="t-meta" style="margin-bottom:2px">· <strong>{ch}</strong></div>' for ch in _must_covs)
-        _miss_note = ""
-        if _missing_covs:
-            _miss_note = f'<div class="t-meta" style="color:{C["red"]};margin-top:6px">⚠️ Not in dataset: {", ".join(_missing_covs)} — request spend data from the client or agency.</div>'
-        st.markdown(f'''<div style="background:{C["amber"]}11;border:1px solid {C["amber"]}55;border-radius:10px;padding:12px 16px;margin-bottom:14px">
-<div class="t-meta" style="font-weight:700;color:{C["amber"]};margin-bottom:6px">Brief requires these channels as covariates:</div>
-{_warn_html}{_miss_note}
-<div class="t-meta" style="margin-top:6px;font-style:italic">These channels scaled in parallel with TikTok — excluding them risks attributing their lift to TikTok.</div>
-</div>''', unsafe_allow_html=True)
-
     mc1, mc2 = st.columns(2)
     with mc1:
         default_target = st.session_state.target_col or (num_cols_sorted_target[0] if num_cols_sorted_target else None)
@@ -4278,9 +4409,7 @@ elif st.session_state.step == 6:
         spend_cols = [c for c in num_cols if c.endswith("Cost") and c != "TotalCost"]
         # hypothesis-aware covariate defaults: prefer columns matching covariate keywords
         hyp_cov_matches = [c for c in num_cols if _col_cov_score(c) < len(_cov_kws) + 1 and c != target_sel]
-        # brief-named channel matches (fuzzy — channel name appears in column name)
-        brief_cov_matches = [c for c in num_cols if any(ch.lower() in c.lower() for ch in _must_covs) and c != target_sel]
-        default_covs = list(dict.fromkeys(brief_cov_matches + hyp_cov_matches + [c for c in spend_cols + flag_cols if c in num_cols and c != target_sel]))
+        default_covs = list(dict.fromkeys(hyp_cov_matches + [c for c in spend_cols + flag_cols if c in num_cols and c != target_sel]))
         default_covs = [c for c in default_covs if c != target_sel]
         # Only pre-select if user hasn't made a manual choice yet
         if st.session_state.ci_covariates:
@@ -4496,13 +4625,13 @@ elif st.session_state.step == 7:
         tgt_name = st.session_state.target_col or "target"
 
         # ── Save brief to knowledge base (once per session, on first results view) ──
-        if st.session_state.ai_synthesis and not st.session_state.get("_kb_saved"):
+        if st.session_state.brief_text and not st.session_state.get("_kb_saved"):
             try:
                 save_brief_to_knowledge_base(
                     advertiser=st.session_state.advertiser or "Unknown",
-                    hypothesis_type=st.session_state.ai_synthesis.get("hypothesis_type", "incrementality"),
+                    hypothesis_type="incrementality",
                     brief_text=st.session_state.brief_text or "",
-                    synthesis=st.session_state.ai_synthesis,
+                    synthesis={},
                     outcome_notes=f"MAPE={st.session_state.ci_mape:.1f}%, p={st.session_state.ci_p_value:.4f}" if st.session_state.ci_mape and st.session_state.ci_p_value else "",
                 )
             except Exception:
@@ -4634,18 +4763,15 @@ elif st.session_state.step == 7:
                             "p_value": f"{pval_r:.4f}" if pval_r is not None else "?",
                             "mape": f"{mape_r:.1f}" if mape_r is not None else "?",
                         }
-                        _syn_n = st.session_state.ai_synthesis or {}
-                        _ccf_n = _syn_n.get("cross_channel_confounders", [])
-                        _confounders_str = ", ".join(cf.get("channel","") for cf in _ccf_n if cf.get("must_include_as_covariate")) or "none"
                         ctx_n = {
                             "advertiser": st.session_state.advertiser,
                             "hypothesis": st.session_state.hypothesis,
-                            "hypothesis_type": _syn_n.get("hypothesis_type", "incrementality"),
+                            "hypothesis_type": "incrementality",
                             "post_start": str(st.session_state.post_start),
                             "post_end":   str(st.session_state.post_end),
                             "target":     tgt_name,
-                            "confounders_included": _confounders_str,
-                            "two_model_recommendation": _syn_n.get("two_model_recommendation", {}),
+                            "confounders_included": "none",
+                            "two_model_recommendation": {},
                         }
                         st.session_state.ci_narrator = call_llm_narrator(ci_sum_n, ctx_n)
                         st.rerun()
